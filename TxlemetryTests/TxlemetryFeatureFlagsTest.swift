@@ -1,0 +1,1625 @@
+//
+//  TxlemetryFeatureFlagsTest.swift
+//  Txlemetry
+//
+//  Created by Yiannis Josephides on 20/01/2025.
+//
+
+import OHHTTPStubs
+@testable import Txlemetry
+import Testing
+import XCTest
+
+/// Sample struct for testing payload decoding
+private struct TestPayload: Decodable, Equatable {
+    let name: String
+    let count: Int
+}
+
+@Suite("Test Feature Flags", .serialized)
+enum TxlemetryFeatureFlagsTest {
+    class BaseTestClass {
+        let config: TxlemetryConfig = {
+            let c = TxlemetryConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            c.preloadFeatureFlags = false
+            c.disableReachabilityForTesting = true
+            c.disableQueueTimerForTesting = true
+            c.disableFlushOnBackgroundForTesting = true
+            return c
+        }()
+
+        var server: MockTxlemetryServer!
+
+        // SDKs created per test, closed in deinit so their queues/timers/observers don't leak
+        // across the run and starve the background thread pool. close() is idempotent.
+        var trackedSuts: [TxlemetrySDK] = []
+        func track(_ sut: TxlemetrySDK) -> TxlemetrySDK {
+            trackedSuts.append(sut)
+            return sut
+        }
+
+        init() {
+            server = MockTxlemetryServer(version: 4)
+            server.start()
+            // important!
+            let storage = TxlemetryStorage(config)
+            storage.reset()
+        }
+
+        deinit {
+            trackedSuts.forEach { $0.close() }
+            server.stop()
+            server = nil
+        }
+
+        func getSut(
+            storage: TxlemetryStorage? = nil,
+            config: TxlemetryConfig? = nil
+        ) -> TxlemetryRemoteConfig {
+            let theConfig = config ?? self.config
+            let theStorage = storage ?? TxlemetryStorage(theConfig)
+            let api = TxlemetryApi(theConfig)
+            return TxlemetryRemoteConfig(theConfig, theStorage, api) { [:] }
+        }
+    }
+
+    @Suite("Test getFeatureFlag")
+    class TestGetFeatureFlagValue: BaseTestClass {
+        @Test("Returns true for enabled Bool flag")
+        func returnsTrueBoolean() async {
+            let sut = getSut()
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+        }
+
+        @Test("Returns true for enabled String flag")
+        func returnsTrueString() async {
+            let sut = getSut()
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            #expect(sut.getFeatureFlag("string-value") as? String == "test")
+        }
+
+        @Test("Returns false for disabled flag")
+        func returnsFalseDisabled() async {
+            let sut = getSut()
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            #expect(sut.getFeatureFlag("disabled-flag") as? Bool == false)
+        }
+
+        @Test("returns feature flag value")
+        func getFeatureFlagValue() async {
+            let sut = getSut()
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            #expect(sut.getFeatureFlag("string-value") as? String == "test")
+        }
+    }
+
+    @Suite("Test getFeatureFlagPayload")
+    class TestGetFeatureFlagPayload: BaseTestClass {
+        @Test("returns feature flag payload as Int")
+        func getFeatureFlagPayloadInt() async {
+            let sut = getSut()
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            #expect(sut.getFeatureFlagPayload("number-value") as? Int == 2)
+        }
+
+        @Test("returns feature flag payload as Dictionary")
+        func getFeatureFlagPayloadDictionary() async {
+            let sut = getSut()
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            #expect(sut.getFeatureFlagPayload("payload-json") as? [String: String] == ["foo": "bar"])
+        }
+    }
+
+    @Suite("Test feature flags loading")
+    class TestLoadFeatureFlagsLoading: BaseTestClass {
+        @Test("loads cached feature flags")
+        func loadsCachedFeatureFlags() {
+            let storage = TxlemetryStorage(config)
+            defer { storage.reset() }
+
+            storage.setDictionary(forKey: .enabledFeatureFlags, contents: ["foo": "bar"])
+
+            let sut = getSut(storage: storage)
+
+            #expect(sut.getFeatureFlags() as? [String: String] == ["foo": "bar"])
+        }
+
+        @Test("merge flags if computed errors")
+        func mergeFlagsIfComputedErrors() async {
+            let sut = getSut()
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            server.errorsWhileComputingFlags = true
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            #expect(sut.getFeatureFlag("new-flag") as? Bool == true)
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+        }
+
+        @Test("retains feature flags when quota limited")
+        func retainsFeatureFlagsWhenQuotaLimited() async {
+            let sut = getSut()
+
+            // First load some feature flags normally
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            // Verify flags are loaded
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+            #expect(sut.getFeatureFlag("string-value") as? String == "test")
+
+            // Now set the server to return quota limited response
+            server.quotaLimitFeatureFlags = true
+
+            // Load flags again, this time with quota limiting
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            // Verify flags are retained (not cleared)
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+            #expect(sut.getFeatureFlag("string-value") as? String == "test")
+        }
+
+        @Test("clear() removes in-memory feature flags")
+        func clearRemovesInMemoryFeatureFlags() async {
+            let sut = getSut()
+
+            // First load some feature flags
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            // Verify flags are loaded in memory
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+            #expect(sut.getFeatureFlag("string-value") as? String == "test")
+
+            // Call clear()
+            sut.clear()
+
+            // Verify flags are cleared from memory
+            #expect(sut.getFeatureFlag("bool-value") == nil)
+            #expect(sut.getFeatureFlag("string-value") == nil)
+            #expect(sut.getFeatureFlags() == nil || sut.getFeatureFlags()?.isEmpty == true)
+        }
+
+        @Test("clear() clears person and group properties for flags")
+        func clearClearsPersonAndGroupProperties() async {
+            let storage = TxlemetryStorage(config)
+            defer { storage.reset() }
+
+            let sut = getSut(storage: storage)
+
+            // Set person and group properties
+            sut.setPersonPropertiesForFlags(["plan": "premium"])
+            sut.setGroupPropertiesForFlags("company", properties: ["name": "Acme"])
+
+            // Verify they are stored in disk
+            let personProps = storage.getDictionary(forKey: .personPropertiesForFlags) as? [String: Any]
+            #expect(personProps?["plan"] as? String == "premium")
+
+            let groupProps = storage.getDictionary(forKey: .groupPropertiesForFlags) as? [String: [String: Any]]
+            #expect(groupProps?["company"]?["name"] as? String == "Acme")
+
+            // Call clear()
+            sut.clear()
+
+            // Verify person and group properties are cleared from disk
+            let clearedPersonProps = storage.getDictionary(forKey: .personPropertiesForFlags) as? [String: Any]
+            #expect(clearedPersonProps?.isEmpty == true || clearedPersonProps == nil)
+
+            let clearedGroupProps = storage.getDictionary(forKey: .groupPropertiesForFlags) as? [String: [String: Any]]
+            #expect(clearedGroupProps?.isEmpty == true || clearedGroupProps == nil)
+
+            // Verify in-memory values are cleared by reloading flags and checking request
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: [:], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            // Check the request doesn't contain the old person properties
+            guard let lastRequest = server.flagsRequests.last,
+                  let requestBody = server.parseRequest(lastRequest, gzip: false)
+            else {
+                #expect(Bool(false), "Failed to parse request body")
+                return
+            }
+
+            // Person properties should be empty or only contain default properties (not "plan")
+            let requestPersonProps = requestBody["person_properties"] as? [String: Any]
+            #expect(requestPersonProps?["plan"] == nil, "Expected 'plan' to be cleared from person properties")
+        }
+    }
+
+    @Suite("Test Person and Group Properties for Flags")
+    class TestPersonAndGroupPropertiesForFlags: BaseTestClass {
+        @Test("Person properties are stored and retrieved correctly")
+        func storeAndRetrievePersonProperties() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Enable person processing by identifying
+            sut.identify("test_user")
+
+            let properties = [
+                "test_property": "test_value",
+                "plan": "premium",
+                "age": 25,
+            ] as [String: Any]
+
+            // Set properties
+            sut.setPersonPropertiesForFlags(properties)
+
+            // Verify they can be retrieved by testing the internal state
+            // Since getPersonPropertiesForFlags is private, we'll test via flag loading
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            // Verify the request included person properties by checking server received data
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            guard let personProperties = requestBody["person_properties"] as? [String: Any] else {
+                #expect(Bool(false), "Person properties not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(personProperties["test_property"] as? String == "test_value", "Expected test_property to be 'test_value'")
+            #expect(personProperties["plan"] as? String == "premium", "Expected plan to be 'premium'")
+            #expect(personProperties["age"] as? Int == 25, "Expected age to be 25")
+        }
+
+        @Test("Person properties are additive")
+        func personPropertiesAreAdditive() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Set first batch of properties
+            sut.setPersonPropertiesForFlags(["property1": "value1", "shared": "original"])
+
+            // Set second batch that overlaps
+            sut.setPersonPropertiesForFlags(["property2": "value2", "shared": "updated"])
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            guard let personProperties = requestBody["person_properties"] as? [String: Any] else {
+                #expect(Bool(false), "Person properties not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(personProperties["property1"] as? String == "value1", "Expected property1 to be 'value1'")
+            #expect(personProperties["property2"] as? String == "value2", "Expected property2 to be 'value2'")
+            #expect(personProperties["shared"] as? String == "updated", "Expected shared property to be 'updated' (latest value)")
+        }
+
+        @Test("Reset person properties clears all properties")
+        func resetPersonPropertiesClearsAll() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Set some properties
+            sut.setPersonPropertiesForFlags(["property1": "value1", "property2": "value2"])
+
+            // Reset them
+            sut.resetPersonPropertiesForFlags()
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            // After reset, person_properties should only contain default device properties, not the custom ones
+            if let personProperties = requestBody["person_properties"] as? [String: Any] {
+                #expect(personProperties["property1"] == nil, "Expected property1 to be removed after reset")
+                #expect(personProperties["property2"] == nil, "Expected property2 to be removed after reset")
+                // Device properties like $device_manufacturer, $os_name etc. are expected to remain
+            }
+        }
+
+        @Test("Group properties are stored and retrieved correctly")
+        func storeAndRetrieveGroupProperties() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            let properties = [
+                "plan": "enterprise",
+                "seats": 50,
+                "industry": "technology",
+            ] as [String: Any]
+
+            // Set group properties
+            sut.setGroupPropertiesForFlags("organization", properties: properties)
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            guard let groupProperties = requestBody["group_properties"] as? [String: [String: Any]] else {
+                #expect(Bool(false), "Group properties not found in request body: \(requestBody)")
+                return
+            }
+
+            guard let orgProperties = groupProperties["organization"] else {
+                #expect(Bool(false), "Organization group properties not found: \(groupProperties)")
+                return
+            }
+
+            #expect(orgProperties["plan"] as? String == "enterprise", "Expected organization plan to be 'enterprise'")
+            #expect(orgProperties["seats"] as? Int == 50, "Expected organization seats to be 50")
+            #expect(orgProperties["industry"] as? String == "technology", "Expected organization industry to be 'technology'")
+        }
+
+        @Test("Multiple group types are handled correctly")
+        func multipleGroupTypesHandled() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Set properties for different group types
+            sut.setGroupPropertiesForFlags("organization", properties: ["plan": "enterprise"])
+            sut.setGroupPropertiesForFlags("team", properties: ["role": "engineering"])
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            guard let groupProperties = requestBody["group_properties"] as? [String: [String: Any]] else {
+                #expect(Bool(false), "Group properties not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(groupProperties["organization"]?["plan"] as? String == "enterprise", "Expected organization plan to be 'enterprise'")
+            #expect(groupProperties["team"]?["role"] as? String == "engineering", "Expected team role to be 'engineering'")
+        }
+
+        @Test("Reset group properties for specific type")
+        func resetGroupPropertiesSpecificType() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Set properties for multiple group types
+            sut.setGroupPropertiesForFlags("organization", properties: ["plan": "enterprise"])
+            sut.setGroupPropertiesForFlags("team", properties: ["role": "engineering"])
+
+            // Reset only organization properties
+            sut.resetGroupPropertiesForFlags("organization")
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            guard let groupProperties = requestBody["group_properties"] as? [String: [String: Any]] else {
+                #expect(Bool(false), "Group properties not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(groupProperties["organization"] == nil, "Expected organization properties to be cleared")
+            #expect(groupProperties["team"]?["role"] as? String == "engineering", "Expected team role to still be 'engineering'")
+        }
+
+        @Test("Reset all group properties")
+        func resetAllGroupProperties() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Set properties for multiple group types
+            sut.setGroupPropertiesForFlags("organization", properties: ["plan": "enterprise"])
+            sut.setGroupPropertiesForFlags("team", properties: ["role": "engineering"])
+
+            // Reset all group properties
+            sut.resetGroupPropertiesForFlags()
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            #expect(requestBody["group_properties"] == nil, "Expected group_properties to be nil after reset")
+        }
+
+        @Test("Both person and group properties sent together")
+        func bothPersonAndGroupPropertiesSent() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Set both types of properties
+            sut.setPersonPropertiesForFlags(["user_plan": "premium"])
+            sut.setGroupPropertiesForFlags("organization", properties: ["org_plan": "enterprise"])
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            // Check person properties
+            guard let personProperties = requestBody["person_properties"] as? [String: Any] else {
+                #expect(Bool(false), "Person properties not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(personProperties["user_plan"] as? String == "premium", "Expected user_plan to be 'premium'")
+
+            // Check group properties
+            guard let groupProperties = requestBody["group_properties"] as? [String: [String: Any]] else {
+                #expect(Bool(false), "Group properties not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(groupProperties["organization"]?["org_plan"] as? String == "enterprise", "Expected organization org_plan to be 'enterprise'")
+        }
+
+        @Test("Capture with userProperties automatically sets person properties for flags")
+        func captureWithUserPropertiesAutomaticallySetsPersonPropertiesForFlags() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Enable person processing
+            sut.identify("test_user")
+
+            // Capture event with user properties
+            sut.capture("test_event", properties: ["event_prop": "value"], userProperties: ["user_plan": "premium"])
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            // Check that person properties from capture were included
+            guard let personProperties = requestBody["person_properties"] as? [String: Any] else {
+                #expect(Bool(false), "Person properties not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(personProperties["user_plan"] as? String == "premium", "Expected user_plan to be 'premium' from capture call")
+        }
+
+        @Test("Group with groupProperties automatically sets group properties for flags")
+        func groupWithGroupPropertiesAutomaticallySetsGroupPropertiesForFlags() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Enable person processing
+            sut.identify("test_user")
+
+            // Call group with properties
+            sut.group(type: "organization", key: "org123", groupProperties: ["org_plan": "enterprise"])
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found in server.flagsRequests")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body from flags request")
+                return
+            }
+
+            // Check that group properties from group call were included
+            guard let groupProperties = requestBody["group_properties"] as? [String: [String: Any]] else {
+                #expect(Bool(false), "Group properties not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(groupProperties["organization"]?["org_plan"] as? String == "enterprise", "Expected organization org_plan to be 'enterprise' from group call")
+        }
+    }
+
+    @Suite("Test getFeatureFlagResult")
+    class TestGetFeatureFlagResult: BaseTestClass {
+        @Test("returns result for enabled boolean flag")
+        func returnsResultForEnabledBoolFlag() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            let result = sut.getFeatureFlagResult("bool-value", sendFeatureFlagEvent: false)
+            #expect(result != nil)
+            #expect(result?.key == "bool-value")
+            #expect(result?.enabled == true)
+            #expect(result?.variant == nil)
+            sut.close()
+        }
+
+        @Test("returns result for string variant flag")
+        func returnsResultForVariantFlag() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            let result = sut.getFeatureFlagResult("string-value", sendFeatureFlagEvent: false)
+            #expect(result != nil)
+            #expect(result?.key == "string-value")
+            #expect(result?.enabled == true)
+            #expect(result?.variant == "test")
+            sut.close()
+        }
+
+        @Test("returns result for disabled flag")
+        func returnsResultForDisabledFlag() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            let result = sut.getFeatureFlagResult("disabled-flag", sendFeatureFlagEvent: false)
+            #expect(result != nil)
+            #expect(result?.key == "disabled-flag")
+            #expect(result?.enabled == false)
+            #expect(result?.variant == nil)
+            sut.close()
+        }
+
+        @Test("returns nil for non-existent flag")
+        func returnsNilForNonExistentFlag() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            let result = sut.getFeatureFlagResult("non-existent-flag", sendFeatureFlagEvent: false)
+            #expect(result == nil)
+            sut.close()
+        }
+
+        @Test("includes payload in result")
+        func includesPayloadInResult() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            let resultInt = sut.getFeatureFlagResult("number-value", sendFeatureFlagEvent: false)
+            #expect(resultInt?.payload as? Int == 2)
+
+            let resultJson = sut.getFeatureFlagResult("payload-json", sendFeatureFlagEvent: false)
+            #expect(resultJson?.payload as? [String: String] == ["foo": "bar"])
+            sut.close()
+        }
+    }
+
+    @Suite("Test getFeatureFlagResult event sending")
+    class TestGetFeatureFlagResultEventSending: BaseTestClass {
+        @Test("sends feature flag called event by default")
+        func sendsEventByDefault() async throws {
+            config.sendFeatureFlagEvent = true
+            config.flushAt = 1
+            let sut = track(TxlemetrySDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            server.reset(batchCount: 1)
+
+            let result = sut.getFeatureFlagResult("bool-value")
+            #expect(result != nil)
+
+            sut.flush()
+            let events = try await getServerEvents(server)
+
+            let featureFlagEvent = events.first { $0.event == "$feature_flag_called" }
+            #expect(featureFlagEvent != nil, "Expected $feature_flag_called event to be sent")
+            #expect(featureFlagEvent?.properties["$feature_flag"] as? String == "bool-value")
+
+            sut.close()
+        }
+
+        @Test("respects sendFeatureFlagEvent parameter when false")
+        func respectsSendEventParameterFalse() async {
+            config.sendFeatureFlagEvent = true
+            config.flushAt = 1
+            let sut = track(TxlemetrySDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            server.reset(batchCount: 1)
+
+            let result = sut.getFeatureFlagResult("bool-value", sendFeatureFlagEvent: false)
+            #expect(result != nil)
+
+            sut.flush()
+
+            let events = getBatchedEvents(server, timeout: 0.5, failIfNotCompleted: false)
+            let featureFlagEvent = events.first { $0.event == "$feature_flag_called" }
+            #expect(
+                featureFlagEvent == nil,
+                "Expected NO $feature_flag_called event when sendFeatureFlagEvent is false"
+            )
+
+            sut.close()
+        }
+
+        @Test("getFeatureFlag returns consistent values with getFeatureFlagResult")
+        func getFeatureFlagReturnsSameValue() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            // Boolean flag: getFeatureFlag returns Bool, getFeatureFlagResult has enabled
+            let boolResult = sut.getFeatureFlagResult("bool-value", sendFeatureFlagEvent: false)
+            let boolValue = sut.getFeatureFlag("bool-value", sendFeatureFlagEvent: false)
+            #expect(boolResult?.enabled == boolValue as? Bool)
+
+            // Variant flag: getFeatureFlag returns variant String, getFeatureFlagResult has variant
+            let stringResult = sut.getFeatureFlagResult("string-value", sendFeatureFlagEvent: false)
+            let stringValue = sut.getFeatureFlag("string-value", sendFeatureFlagEvent: false)
+            #expect(stringResult?.variant == stringValue as? String)
+
+            sut.close()
+        }
+    }
+
+    @Suite("Test getAllFeatureFlags")
+    class TestGetAllFeatureFlags: BaseTestClass {
+        @Test("returns nil before flags are loaded")
+        func returnsNilBeforeLoad() {
+            let sut = track(TxlemetrySDK.with(config))
+            #expect(sut.getAllFeatureFlags() == nil)
+            sut.close()
+        }
+
+        @Test("returns all loaded flags, including disabled ones")
+        func returnsAllFlagsIncludingDisabled() async {
+            let sut = track(TxlemetrySDK.with(config))
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            let all = sut.getAllFeatureFlags()
+            #expect(all != nil)
+
+            // Order is not guaranteed, so key by flag key.
+            let byKey = Dictionary(uniqueKeysWithValues: (all ?? []).map { ($0.key, $0) })
+
+            // Enabled boolean flag
+            #expect(byKey["bool-value"]?.enabled == true)
+            #expect(byKey["bool-value"]?.variant == nil)
+
+            // Multivariate flag carries its variant
+            #expect(byKey["string-value"]?.enabled == true)
+            #expect(byKey["string-value"]?.variant == "test")
+
+            // Disabled flag is INCLUDED as enabled=false (not filtered out) — matches Android.
+            #expect(byKey["disabled-flag"] != nil, "disabled flags should be included in the result")
+            #expect(byKey["disabled-flag"]?.enabled == false)
+            #expect(byKey["disabled-flag"]?.variant == nil)
+
+            sut.close()
+        }
+
+        @Test("decodes payloads (object and scalar)")
+        func decodesPayloads() async {
+            let sut = track(TxlemetrySDK.with(config))
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            let byKey = Dictionary(uniqueKeysWithValues: (sut.getAllFeatureFlags() ?? []).map { ($0.key, $0) })
+
+            // Scalar payload parsed via .fragmentsAllowed
+            #expect(byKey["number-value"]?.payload as? Int == 2)
+            // Object payload parsed to a dictionary
+            #expect(byKey["payload-json"]?.payload as? [String: String] == ["foo": "bar"])
+
+            sut.close()
+        }
+
+        @Test("each result matches getFeatureFlagResult for that key")
+        func matchesSingleKeyResult() async {
+            let sut = track(TxlemetrySDK.with(config))
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            for flag in sut.getAllFeatureFlags() ?? [] {
+                let single = sut.getFeatureFlagResult(flag.key, sendFeatureFlagEvent: false)
+                #expect(flag.enabled == single?.enabled, "enabled mismatch for \(flag.key)")
+                #expect(flag.variant == single?.variant, "variant mismatch for \(flag.key)")
+            }
+
+            sut.close()
+        }
+
+        @Test("does not send $feature_flag_called")
+        func doesNotSendEvent() async {
+            config.sendFeatureFlagEvent = true
+            config.flushAt = 1
+            let sut = track(TxlemetrySDK.with(config))
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            server.reset(batchCount: 1)
+
+            _ = sut.getAllFeatureFlags()
+
+            sut.flush()
+            let events = getBatchedEvents(server, timeout: 0.5, failIfNotCompleted: false)
+            let ffEvent = events.first { $0.event == "$feature_flag_called" }
+            #expect(ffEvent == nil, "getAllFeatureFlags must not emit $feature_flag_called")
+
+            sut.close()
+        }
+    }
+
+    @Suite("Test TxlemetryFeatureFlagResult payload methods")
+    final class TestFeatureFlagResultPayloadMethods {
+        @Test("payloadAs returns nil for nil payload")
+        func payloadAsNil() {
+            let result = TxlemetryFeatureFlagResult(
+                key: "test", enabled: true, variant: nil, payload: nil
+            )
+            let decoded: TestPayload? = result.payloadAs(TestPayload.self)
+            #expect(decoded == nil)
+        }
+
+        @Test("payloadAs returns direct type match for String")
+        func payloadAsDirectMatchString() {
+            let result = TxlemetryFeatureFlagResult(
+                key: "test", enabled: true, variant: nil, payload: "hello"
+            )
+            let decoded: String? = result.payloadAs(String.self)
+            #expect(decoded == "hello")
+        }
+
+        @Test("payloadAs returns direct type match for Int")
+        func payloadAsDirectMatchInt() {
+            let result = TxlemetryFeatureFlagResult(
+                key: "test", enabled: true, variant: nil, payload: 42
+            )
+            let decoded: Int? = result.payloadAs(Int.self)
+            #expect(decoded == 42)
+        }
+
+        @Test("payloadAs returns direct type match for Dictionary")
+        func payloadAsDirectMatchDict() {
+            let payload = ["foo": "bar"]
+            let result = TxlemetryFeatureFlagResult(
+                key: "test", enabled: true, variant: nil, payload: payload
+            )
+            let decoded: [String: String]? = result.payloadAs([String: String].self)
+            #expect(decoded == ["foo": "bar"])
+        }
+
+        @Test("payloadAs decodes dictionary to Decodable struct")
+        func payloadAsDecodable() {
+            let payload: [String: Any] = ["name": "Test", "count": 5]
+            let result = TxlemetryFeatureFlagResult(
+                key: "test", enabled: true, variant: nil, payload: payload
+            )
+            let decoded: TestPayload? = result.payloadAs(TestPayload.self)
+            #expect(decoded?.name == "Test")
+            #expect(decoded?.count == 5)
+        }
+
+        @Test("payloadAs returns nil for invalid JSON structure")
+        func payloadAsInvalidType() {
+            // A Date is not a valid JSON object
+            let result = TxlemetryFeatureFlagResult(
+                key: "test", enabled: true, variant: nil, payload: Date()
+            )
+            let decoded: TestPayload? = result.payloadAs(TestPayload.self)
+            #expect(decoded == nil)
+        }
+
+        @Test("payloadAs returns nil when decoding fails")
+        func payloadAsDecodingFails() {
+            // Payload structure doesn't match TestPayload
+            let payload: [String: Any] = ["wrongKey": "wrongValue"]
+            let result = TxlemetryFeatureFlagResult(
+                key: "test", enabled: true, variant: nil, payload: payload
+            )
+            let decoded: TestPayload? = result.payloadAs(TestPayload.self)
+            #expect(decoded == nil)
+        }
+    }
+
+    @Suite("Test Evaluation Contexts")
+    class TestEvaluationContexts: BaseTestClass {
+        @Test("Evaluation contexts are included in flags request")
+        func evaluationContextsIncludedInRequest() async {
+            // Configure evaluation contexts
+            config.evaluationContexts = ["production", "web", "checkout"]
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Enable person processing
+            sut.identify("test_user")
+
+            // Load feature flags
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            // Verify the request included evaluation contexts
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body")
+                return
+            }
+
+            guard let evaluationContexts = requestBody["evaluation_contexts"] as? [String] else {
+                #expect(Bool(false), "Evaluation contexts not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(evaluationContexts.count == 3, "Expected 3 evaluation contexts")
+            #expect(evaluationContexts.contains("production"), "Expected 'production' in evaluation contexts")
+            #expect(evaluationContexts.contains("web"), "Expected 'web' in evaluation contexts")
+            #expect(evaluationContexts.contains("checkout"), "Expected 'checkout' in evaluation contexts")
+        }
+
+        @Test("Empty evaluation contexts not included in request")
+        func emptyEvaluationContextsNotIncluded() async {
+            // Configure with empty evaluation contexts
+            config.evaluationContexts = []
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Enable person processing
+            sut.identify("test_user")
+
+            // Load feature flags
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            // Verify the request did NOT include evaluation contexts
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body")
+                return
+            }
+
+            #expect(requestBody["evaluation_contexts"] == nil, "Expected evaluation_contexts to NOT be present when empty")
+        }
+
+        @Test("Nil evaluation contexts not included in request")
+        func nilEvaluationContextsNotIncluded() async {
+            // Don't set evaluation contexts (leave as nil)
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Enable person processing
+            sut.identify("test_user")
+
+            // Load feature flags
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            // Verify the request did NOT include evaluation contexts
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body")
+                return
+            }
+
+            #expect(requestBody["evaluation_contexts"] == nil, "Expected evaluation_contexts to NOT be present when nil")
+        }
+
+        @Test("Can update evaluation contexts after initialization")
+        func canUpdateEvaluationContexts() async {
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Enable person processing
+            sut.identify("test_user")
+
+            // Initially no evaluation contexts
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            guard let firstRequest = server.flagsRequests.last,
+                  let firstRequestBody = server.parseRequest(firstRequest, gzip: false)
+            else {
+                #expect(Bool(false), "Failed to parse first request")
+                return
+            }
+
+            #expect(firstRequestBody["evaluation_contexts"] == nil, "Expected no evaluation_contexts in first request")
+
+            // Update evaluation contexts
+            config.evaluationContexts = ["staging", "mobile"]
+
+            // Reload flags
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            guard let secondRequest = server.flagsRequests.last,
+                  let secondRequestBody = server.parseRequest(secondRequest, gzip: false)
+            else {
+                #expect(Bool(false), "Failed to parse second request")
+                return
+            }
+
+            guard let evaluationContexts = secondRequestBody["evaluation_contexts"] as? [String] else {
+                #expect(Bool(false), "Evaluation contexts not found in second request")
+                return
+            }
+
+            #expect(evaluationContexts.count == 2, "Expected 2 evaluation contexts in second request")
+            #expect(evaluationContexts.contains("staging"), "Expected 'staging' in evaluation contexts")
+            #expect(evaluationContexts.contains("mobile"), "Expected 'mobile' in evaluation contexts")
+        }
+
+        @Test("Deprecated evaluationEnvironments property still works")
+        func deprecatedEvaluationEnvironmentsStillWorks() async {
+            // Use the deprecated property
+            config.evaluationEnvironments = ["production", "api"]
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Verify the deprecated property maps to evaluationContexts
+            #expect(config.evaluationContexts?.count == 2, "Expected evaluationContexts to be set via deprecated property")
+            #expect(config.evaluationContexts?.contains("production") == true, "Expected 'production' in evaluationContexts")
+            #expect(config.evaluationContexts?.contains("api") == true, "Expected 'api' in evaluationContexts")
+
+            // Verify reading from deprecated property returns same values
+            #expect(config.evaluationEnvironments?.count == 2, "Expected evaluationEnvironments getter to return same values")
+            #expect(config.evaluationEnvironments?.contains("production") == true, "Expected 'production' from evaluationEnvironments getter")
+            #expect(config.evaluationEnvironments?.contains("api") == true, "Expected 'api' from evaluationEnvironments getter")
+
+            // Enable person processing
+            sut.identify("test_user")
+
+            // Load feature flags
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            // Verify the request included evaluation contexts (set via deprecated property)
+            #expect(server.flagsRequests.count > 0, "Expected at least one flags request to be made")
+
+            guard let lastRequest = server.flagsRequests.last else {
+                #expect(Bool(false), "No flags request found")
+                return
+            }
+
+            guard let requestBody = server.parseRequest(lastRequest, gzip: false) else {
+                #expect(Bool(false), "Failed to parse request body")
+                return
+            }
+
+            guard let evaluationContexts = requestBody["evaluation_contexts"] as? [String] else {
+                #expect(Bool(false), "Evaluation contexts not found in request body: \(requestBody)")
+                return
+            }
+
+            #expect(evaluationContexts.count == 2, "Expected 2 evaluation contexts")
+            #expect(evaluationContexts.contains("production"), "Expected 'production' in evaluation contexts")
+            #expect(evaluationContexts.contains("api"), "Expected 'api' in evaluation contexts")
+        }
+    }
+
+    @Suite("Test Bootstrap Feature Flags")
+    class TestBootstrapFeatureFlags: BaseTestClass {
+        private func bootstrapConfig(
+            featureFlags: [String: Any],
+            featureFlagPayloads: [String: Any]? = nil
+        ) -> TxlemetryConfig {
+            let c = TxlemetryConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            c.preloadFeatureFlags = false
+            c.disableReachabilityForTesting = true
+            c.disableQueueTimerForTesting = true
+            c.disableFlushOnBackgroundForTesting = true
+            c.disableRemoteConfigForTesting = true
+            c.bootstrap = TxlemetryBootstrapConfig(
+                featureFlags: featureFlags,
+                featureFlagPayloads: featureFlagPayloads
+            )
+            return c
+        }
+
+        private func freshStorage(_ config: TxlemetryConfig) -> TxlemetryStorage {
+            let storage = TxlemetryStorage(config)
+            storage.reset()
+            return storage
+        }
+
+        @Test("Bootstrapped flags are readable immediately after setup")
+        func servesBootstrappedFlagsBeforeLoad() {
+            let config = bootstrapConfig(featureFlags: ["beta-ui": true])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            #expect(sut.getFeatureFlag("beta-ui") as? Bool == true)
+        }
+
+        @Test("Non-serializable bootstrapped values are dropped, not crashed on")
+        func sanitizesInvalidBootstrappedValues() {
+            // A non-JSON-serializable value (NaN) reaching the flag cache would raise an
+            // uncatchable NSException in JSONSerialization; setup must drop it, not crash.
+            let config = bootstrapConfig(
+                featureFlags: ["good": true, "bad": Double.nan],
+                featureFlagPayloads: ["good": ["k": "v"], "bad": ["n": Double.infinity]]
+            )
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            #expect(sut.getFeatureFlag("good") as? Bool == true)
+            #expect(sut.getFeatureFlag("bad") == nil)
+            #expect(sut.getFeatureFlagPayload("bad") == nil)
+        }
+
+        @Test("Bootstrapped payload is served with its flag")
+        func servesBootstrappedPayload() {
+            let config = bootstrapConfig(
+                featureFlags: ["beta-ui": "variant-a"],
+                featureFlagPayloads: ["beta-ui": ["color": "blue"]]
+            )
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            #expect(sut.getFeatureFlag("beta-ui") as? String == "variant-a")
+            #expect(sut.getFeatureFlagPayload("beta-ui") as? [String: String] == ["color": "blue"])
+        }
+
+        @Test("Loaded flags override bootstrapped values")
+        func loadedFlagsOverrideBootstrap() async {
+            let config = bootstrapConfig(featureFlags: ["bool-value": "bootstrapped-variant"])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            // Before load: the bootstrapped value wins
+            #expect(sut.getFeatureFlag("bool-value") as? String == "bootstrapped-variant")
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: [:], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            // After load: the server value (true) replaces the bootstrapped one
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+        }
+
+        @Test("A disabled (false) bootstrap flag is not served")
+        func disabledBootstrapFlagNotServed() {
+            let config = bootstrapConfig(featureFlags: ["enabled": true, "disabled": false, "variant": "v1"])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            // Only enabled flags (truthy values) are served, matching txlemetry-js.
+            #expect(sut.getFeatureFlag("enabled") as? Bool == true)
+            #expect(sut.getFeatureFlag("variant") as? String == "v1")
+            #expect(sut.getFeatureFlag("disabled") == nil)
+        }
+
+        @Test("A payload for a disabled bootstrap flag is not served")
+        func disabledBootstrapPayloadNotServed() {
+            let config = bootstrapConfig(
+                featureFlags: ["enabled": "v1", "disabled": false],
+                featureFlagPayloads: ["enabled": ["k": "v"], "disabled": ["k": "x"]]
+            )
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            #expect(sut.getFeatureFlagPayload("enabled") as? [String: String] == ["k": "v"])
+            #expect(sut.getFeatureFlagPayload("disabled") == nil)
+        }
+
+        @Test("A complete flags load drops bootstrapped-only keys")
+        func completeLoadDropsBootstrappedOnlyKeys() async {
+            let config = bootstrapConfig(featureFlags: ["bool-value": true, "legacy": true])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            // Before load: both bootstrapped keys are served
+            #expect(sut.getFeatureFlag("legacy") as? Bool == true)
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: [:], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            // A complete /flags response replaces the served flags: bootstrapped-only "legacy" is
+            // dropped, and the overlapping key reflects the loaded value.
+            #expect(sut.getFeatureFlag("legacy") == nil)
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+        }
+
+        @Test("Bootstrap is first-session only: not resurrected after reset")
+        func bootstrapNotReappliedAfterReset() async {
+            let config = bootstrapConfig(featureFlags: ["legacy": true])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            func load() async {
+                await withCheckedContinuation { continuation in
+                    sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: [:], callback: { _ in
+                        continuation.resume()
+                    })
+                }
+            }
+
+            // Bootstrap serves "legacy" before any load
+            #expect(sut.getFeatureFlag("legacy") as? Bool == true)
+
+            await load()
+            #expect(sut.hasLoadedFeatureFlagsFromRemote() == true)
+
+            // reset() clears the retained bootstrap and the loaded-from-remote latch
+            sut.clear()
+            #expect(sut.hasLoadedFeatureFlagsFromRemote() == false)
+
+            // A reload for the new (post-reset) user must NOT re-inject the bootstrapped-only key
+            await load()
+            #expect(sut.getFeatureFlag("legacy") == nil)
+        }
+
+        @Test("Bootstrap seed fires the flags-loaded notification")
+        @MainActor
+        func bootstrapSeedFiresFlagsLoaded() async {
+            let config = bootstrapConfig(featureFlags: ["beta-ui": true])
+            let flagsLoaded = AsyncLatch()
+            var receivedFlags: [String: Any]?
+
+            // @MainActor keeps this deterministic: init fires the notify on the main queue, which can't
+            // run until we suspend at `await` below, so the subscription is always registered first.
+            let sut = getSut(storage: freshStorage(config), config: config)
+            let token = sut.onFeatureFlagsLoaded.subscribe { flags in
+                receivedFlags = flags
+                flagsLoaded.signal()
+            }
+
+            await flagsLoaded.wait()
+
+            #expect(receivedFlags?["beta-ui"] as? Bool == true)
+            _ = token
+        }
+    }
+
+    @Suite("Test Bootstrap Feature Flag Reporting")
+    class TestBootstrapFeatureFlagReporting: BaseTestClass {
+        private func enrichmentConfig(
+            featureFlags: [String: Any],
+            featureFlagPayloads: [String: Any]? = nil
+        ) -> TxlemetryConfig {
+            let c = TxlemetryConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            c.preloadFeatureFlags = false
+            c.disableReachabilityForTesting = true
+            c.disableQueueTimerForTesting = true
+            c.disableFlushOnBackgroundForTesting = true
+            c.disableRemoteConfigForTesting = true
+            c.captureApplicationLifecycleEvents = false
+            c.captureScreenViews = false
+            c.sendFeatureFlagEvent = true
+            c.flushAt = 1
+            c.bootstrap = TxlemetryBootstrapConfig(
+                featureFlags: featureFlags,
+                featureFlagPayloads: featureFlagPayloads
+            )
+            return c
+        }
+
+        @Test("$feature_flag_called reports bootstrap use before a flags response")
+        func reportsUsedBootstrapTrueBeforeLoad() async throws {
+            let config = enrichmentConfig(
+                featureFlags: ["beta-ui": true],
+                featureFlagPayloads: ["beta-ui": ["color": "blue"]]
+            )
+            let sut = track(TxlemetrySDK.with(config))
+
+            server.reset(batchCount: 1)
+
+            _ = sut.getFeatureFlag("beta-ui")
+            sut.flush()
+
+            let events = try await getServerEvents(server)
+            let event = events.first {
+                $0.event == "$feature_flag_called" && $0.properties["$feature_flag"] as? String == "beta-ui"
+            }
+            #expect(event != nil)
+            #expect(event?.properties["$used_bootstrap_value"] as? Bool == true)
+            #expect(event?.properties["$feature_flag_bootstrapped_response"] as? Bool == true)
+            #expect(event?.properties["$feature_flag_bootstrapped_payload"] as? [String: String] == ["color": "blue"])
+
+            sut.close()
+        }
+
+        @Test("$feature_flag_called reports bootstrap not used after a flags response")
+        func reportsUsedBootstrapFalseAfterLoad() async throws {
+            let config = enrichmentConfig(featureFlags: ["beta-ui": true])
+            let sut = track(TxlemetrySDK.with(config))
+
+            // Receive a /flags response first
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            server.reset(batchCount: 1)
+
+            _ = sut.getFeatureFlag("beta-ui")
+            sut.flush()
+
+            let events = try await getServerEvents(server)
+            let event = events.first {
+                $0.event == "$feature_flag_called" && $0.properties["$feature_flag"] as? String == "beta-ui"
+            }
+            #expect(event != nil)
+            #expect(event?.properties["$used_bootstrap_value"] as? Bool == false)
+            // still reports the originally-bootstrapped response for the key
+            #expect(event?.properties["$feature_flag_bootstrapped_response"] as? Bool == true)
+
+            sut.close()
+        }
+    }
+
+    @Suite("Test concurrent flag reload coalescing", .timeLimit(.minutes(1)))
+    class TestConcurrentFlagReloads: BaseTestClass {
+        /// Held by the first `/flags` response until the test has issued the reloads that must
+        /// coalesce behind it. Wall-clock delays leave that window to chance; this makes it certain.
+        private let firstResponseGate = DispatchSemaphore(value: 0)
+
+        /// Stubs `/flags` so that `override-flag` is only enabled when the request body actually
+        /// carried `app_version_semver`. That makes a callback resolved against a real response
+        /// distinguishable from one resolved against disk-cached, pre-override values.
+        private func stubFlagsRequiringOverride(delay: TimeInterval, gateFirstResponse: Bool = false) {
+            server.flagsResponseDelay = delay
+            let gate = firstResponseGate
+            nonisolated(unsafe) var gated = gateFirstResponse
+            server.flagsResponseHandler = { request in
+                if gated {
+                    gated = false
+                    gate.wait()
+                }
+                var personProperties: [String: Any]?
+                if let data = request.body(),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                {
+                    personProperties = json["person_properties"] as? [String: Any]
+                }
+                let carriedOverride = personProperties?["app_version_semver"] as? String == "3.09.0"
+
+                let body: [String: Any] = [
+                    "featureFlags": ["override-flag": carriedOverride],
+                    "featureFlagPayloads": [String: Any](),
+                    "errorsWhileComputingFlags": false,
+                ]
+                return HTTPStubsResponse(jsonObject: body, statusCode: 200, headers: nil)
+            }
+        }
+
+        @Test("a reload displaced from the pending slot resolves against a request that went out")
+        func displacedReloadResolvesAgainstRealResponse() async {
+            let sut = getSut()
+            stubFlagsRequiringOverride(delay: 0, gateFirstResponse: true)
+
+            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: nil, groups: [:], callback: { _ in })
+            sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"])
+
+            let flags = await withCheckedContinuation { (continuation: CheckedContinuation<[String: Any]?, Never>) in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: nil, groups: [:], callback: { flags in
+                    continuation.resume(returning: flags)
+                })
+
+                // displaces the reload above out of the pending slot
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: nil, groups: [:], callback: { _ in })
+                firstResponseGate.signal()
+            }
+
+            #expect(flags?["override-flag"] as? Bool == true)
+            let sent = server.flagsRequests.compactMap { server.parseRequest($0, gzip: false) }
+            #expect(sent.count == 2, "the two displaced reloads should coalesce into one request")
+            let lastOverride = (sent.last?["person_properties"] as? [String: Any])?["app_version_semver"] as? String
+            #expect(lastOverride == "3.09.0", "the coalesced request must carry the override")
+        }
+
+        @Test("setup -> set properties -> identify -> reload reads flags evaluated with the overrides")
+        func startupSequenceReadsFlagsWithOverrides() async {
+            let config = TxlemetryConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            config.preloadFeatureFlags = true
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+            config.captureApplicationLifecycleEvents = false
+            config.captureScreenViews = false
+            config.sendFeatureFlagEvent = false
+
+            // /config resolves while the first /flags request is still in flight, so the automatic
+            // preload it kicks off competes with the app's own reloads.
+            stubFlagsRequiringOverride(delay: 0.3)
+            server.configResponseDelay = 0.15
+
+            let sut = track(TxlemetrySDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"])
+                sut.identify("test_user")
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true)
+        }
+
+        @Test("setting properties then reloading resolves after a response carrying them")
+        func setPropertiesThenReloadResolvesWithProperties() async {
+            let sut = track(TxlemetrySDK.with(makeIsolatedConfig()))
+            stubFlagsRequiringOverride(delay: 0)
+
+            await withCheckedContinuation { continuation in
+                sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"], reloadFeatureFlags: false)
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true)
+        }
+
+        @Test("a queued reload carries person properties set while it waits")
+        func queuedReloadCarriesLatePersonProperties() async {
+            let sut = track(TxlemetrySDK.with(makeIsolatedConfig()))
+            stubFlagsRequiringOverride(delay: 0.2)
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags()
+                sut.reloadFeatureFlags { continuation.resume() }
+                sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"], reloadFeatureFlags: false)
+            }
+
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true)
+            let lastOverride = server.flagsRequests.last
+                .flatMap { server.parseRequest($0, gzip: false) }
+                .flatMap { $0["person_properties"] as? [String: Any] }?["app_version_semver"] as? String
+            #expect(lastOverride == "3.09.0", "the queued reload must send properties set while it waited")
+        }
+
+        @Test("a failed reload resolves the completion and keeps the cached flags")
+        func completionResolvesOnFailedReload() async {
+            let sut = track(TxlemetrySDK.with(makeIsolatedConfig()))
+            stubFlagsRequiringOverride(delay: 0)
+            await withCheckedContinuation { continuation in
+                sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"], reloadFeatureFlags: false)
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true)
+
+            server.flagsResponseHandler = { _ in
+                HTTPStubsResponse(jsonObject: ["error": "nope"], statusCode: 400, headers: nil)
+            }
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true, "a failed reload must not clear cached flags")
+        }
+
+        private func makeIsolatedConfig() -> TxlemetryConfig {
+            let config = TxlemetryConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            config.preloadFeatureFlags = false
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+            config.disableRemoteConfigForTesting = true
+            config.captureApplicationLifecycleEvents = false
+            config.captureScreenViews = false
+            config.sendFeatureFlagEvent = false
+            return config
+        }
+    }
+}

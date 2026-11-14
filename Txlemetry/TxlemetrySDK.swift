@@ -1,0 +1,3575 @@
+// swiftlint:disable file_length cyclomatic_complexity
+
+//
+//  TxlemetrySDK.swift
+//  TxlemetrySDK
+//
+//  Created by Ben White on 07.02.23.
+//
+
+import Foundation
+
+#if os(iOS) || os(tvOS)
+    import UIKit
+#elseif os(macOS)
+    import AppKit
+#elseif os(watchOS)
+    import WatchKit
+#endif
+
+#if os(iOS) || os(macOS)
+    import UserNotifications
+#endif
+
+// SDK compliance harness 0.9.0 validates retry timing against this base cadence.
+let retryDelay = 1.0
+let maxRetryDelay = 30.0
+
+// renamed to TxlemetrySDK due to https://github.com/apple/swift/issues/56573
+/// Main entry point for capturing analytics, feature flags, logs, surveys, and session replay.
+///
+/// Use `TxlemetrySDK.shared` for the default singleton instance, or `TxlemetrySDK.with(_:)`
+/// to create an additional configured instance.
+@objc public class TxlemetrySDK: NSObject { // swiftlint:disable:this type_body_length
+    private var _config: TxlemetryConfig
+    /// `config`/`remoteConfig`/`queue`/`replayQueue` are written under `setupLock` (setup/close) and
+    /// read from arbitrary caller threads (capture(), debugProperties()) — guard the references
+    /// themselves with the same (recursive) lock so a reader never races `close()`'s teardown.
+    private(set) var config: TxlemetryConfig {
+        get { setupLock.withLock { _config } }
+        set { setupLock.withLock { _config = newValue } }
+    }
+
+    private init(_ config: TxlemetryConfig) {
+        _config = config
+    }
+
+    private var enabled = false
+    private let setupLock = NSRecursiveLock()
+    private let optOutLock = NSLock()
+    private let groupsLock = NSLock()
+    private let flagCallReportedLock = NSLock()
+    private let personPropsLock = NSLock()
+    private let cachedPersonPropertiesLock = NSLock()
+    private let identifyLock = NSLock()
+
+    private let lastScreenLock = NSLock()
+    private var _lastScreenName: String?
+    var lastScreenName: String? {
+        lastScreenLock.withLock { _lastScreenName }
+    }
+
+    private var pushSubscriptionHandler: TxlemetryPushSubscriptionHandler?
+    private var _queue: TxlemetryQueue<TxlemetryEvent>?
+    private var queue: TxlemetryQueue<TxlemetryEvent>? {
+        get { setupLock.withLock { _queue } }
+        set { setupLock.withLock { _queue = newValue } }
+    }
+
+    private let exceptionStepsBufferLock = NSLock()
+    private var _exceptionStepsBuffer: TxlemetryExceptionStepsBuffer?
+    /// The reference is written under `setupLock` (setup/close/optIn) and read from arbitrary caller
+    /// threads (addExceptionStep/capture), so guard the reference itself with its own lock.
+    private var exceptionStepsBuffer: TxlemetryExceptionStepsBuffer? {
+        get { exceptionStepsBufferLock.withLock { _exceptionStepsBuffer } }
+        set { exceptionStepsBufferLock.withLock { _exceptionStepsBuffer = newValue } }
+    }
+    /// Fired with the buffer's current steps whenever they change. The error-tracking autocapture
+    /// integration subscribes to mirror them into the crash reporter's `customData`.
+    let onExceptionStepsChanged = TxlemetryMulticastCallback<[[String: Any]]>()
+    private var _replayQueue: TxlemetryReplayQueue?
+    private(set) var replayQueue: TxlemetryReplayQueue? {
+        get { setupLock.withLock { _replayQueue } }
+        set { setupLock.withLock { _replayQueue = newValue } }
+    }
+
+    private(set) var logsQueue: TxlemetryQueue<TxlemetryLogRecord>?
+    private(set) var storage: TxlemetryStorage?
+    private var surveyIdentityGeneration: String?
+    #if !os(watchOS)
+        private var reachability: Reachability?
+    #endif
+    private var flagCallReported: [String: [Any?]] = .init()
+    private var _remoteConfig: TxlemetryRemoteConfig?
+    private(set) var remoteConfig: TxlemetryRemoteConfig? {
+        get { setupLock.withLock { _remoteConfig } }
+        set { setupLock.withLock { _remoteConfig = newValue } }
+    }
+
+    private var context: TxlemetryContext?
+    private static var projectTokens = Set<String>()
+    private var installedIntegrations: [TxlemetryIntegration] = []
+    let sessionManager = TxlemetrySessionManager()
+    let onEventCaptured = TxlemetryMulticastCallback<TxlemetryEvent>()
+    /// Fired after the event context changes (identify, reset, group, register). Integrations such as
+    /// crash reporting subscribe to snapshot the context for crash-time capture.
+    let onEventContextChanged = TxlemetryMulticastCallback<[String: Any]>()
+    private var sessionIdChangedToken: RegistrationToken?
+    private var didEnterBackgroundToken: RegistrationToken?
+    private var pushRemoteConfigToken: RegistrationToken?
+
+    /// Logger facade exposing `trace/debug/info/warn/error/fatal(_:attributes:)`.
+    /// `nil` before `setup(_:)` is called.
+    @objc public private(set) var logger: TxlemetryLogger?
+
+    #if os(iOS)
+        private weak var _replayIntegration: TxlemetryReplayIntegration?
+        /// Same shape as `queue`/`replayQueue` above: written under `setupLock` by install/uninstall,
+        /// read from any caller thread by `buildProperties`.
+        private var replayIntegration: TxlemetryReplayIntegration? {
+            get { setupLock.withLock { _replayIntegration } }
+            set { setupLock.withLock { _replayIntegration = newValue } }
+        }
+
+        private weak var surveysIntegration: TxlemetrySurveyIntegration?
+    #endif
+
+    // nonisolated(unsafe) is introduced in Swift 5.10
+    #if swift(>=5.10)
+        /// Shared singleton SDK instance used by most applications.
+        ///
+        /// Call `setup(_:)` once with a `TxlemetryConfig` before using capture APIs.
+        @objc public nonisolated(unsafe) static let shared: TxlemetrySDK = .init(TxlemetryConfig(projectToken: ""))
+    #else
+        /// Shared singleton SDK instance used by most applications.
+        ///
+        /// Call `setup(_:)` once with a `TxlemetryConfig` before using capture APIs.
+        @objc public static let shared: TxlemetrySDK = .init(TxlemetryConfig(projectToken: ""))
+    #endif
+
+    deinit {
+        #if !os(watchOS)
+            self.reachability?.stopNotifier()
+        #endif
+
+        sessionIdChangedToken = nil
+        uninstallIntegrations()
+    }
+
+    /// Enables or disables SDK debug logging at runtime.
+    ///
+    /// - Parameter enabled: Pass `true` to enable verbose logs or `false` to disable them.
+    @objc public func debug(_ enabled: Bool = true) {
+        if !isEnabled() {
+            return
+        }
+
+        toggleHedgeLog(enabled)
+    }
+
+    /// Initializes this SDK instance with the provided configuration.
+    ///
+    /// Call this once, as early as possible in app startup. Calls made before setup completes are ignored.
+    /// Calling setup again on the same instance logs a warning and has no effect.
+    ///
+    /// - Parameter config: The configuration to install.
+    @objc public func setup(_ config: TxlemetryConfig) {
+        setupLock.withLock {
+            toggleHedgeLog(config.debug)
+            if enabled {
+                hedgeLog("Setup called despite already being setup!")
+                return
+            }
+
+            if config.projectToken.isEmpty {
+                hedgeLog("Txlemetry SDK will be disabled because projectToken or apiKey is empty.")
+                return
+            }
+
+            if TxlemetrySDK.projectTokens.contains(config.projectToken) {
+                hedgeLog("Project token: \(config.projectToken) already has a Txlemetry instance.")
+            } else {
+                TxlemetrySDK.projectTokens.insert(config.projectToken)
+            }
+
+            enabled = true
+            self.config = config
+            let theStorage = TxlemetryStorage(config)
+            storage = theStorage
+            let api = TxlemetryApi(config)
+
+            config.storageManager = config.storageManager ?? TxlemetryStorageManager(config)
+
+            // Ensure device_id is initialized before remote config loads, so it's
+            // available for flag requests. Seeded from the anonymous ID on first init.
+            _ = config.storageManager?.getDeviceId()
+
+            remoteConfig = TxlemetryRemoteConfig(config, theStorage, api, { [weak self] in
+                self?.getDefaultPersonProperties() ?? [:]
+            }, { [weak self] flagKey, flagValue in
+                self?.reportFeatureFlagCalled(flagKey: flagKey, flagValue: flagValue)
+            })
+
+            #if !os(watchOS)
+                do {
+                    reachability = try Reachability()
+                } catch {
+                    // ignored
+                }
+                context = TxlemetryContext(reachability)
+            #else
+                context = TxlemetryContext()
+            #endif
+
+            pushSubscriptionHandler = TxlemetryPushSubscriptionHandler(
+                api,
+                theStorage,
+                config,
+                distinctIdProvider: { [weak self] in self?.getDistinctId() ?? "" },
+                isConnectedProvider: { [weak self] in self?.isNetworkReachable() ?? true },
+                isAllowedProvider: { [weak self] in
+                    self.map { $0.isEnabled() && !$0.isOptOutState() } ?? false
+                },
+                isEnabledProvider: { [weak self] in self?.isEnabled() ?? false },
+                pushAppIdsProvider: { [weak self] in self?.remoteConfig?.getPushAppIds() },
+                onEventContextChanged: onEventContextChanged
+            )
+
+            // A device whose project had no push integration was answered 200 and stopped asking.
+            // Draining the transition here is the only signal that reaches it.
+            pushRemoteConfigToken = remoteConfig?.onRemoteConfigLoaded.subscribe { [weak self] _ in
+                guard let self, let newlyRegisterable = self.remoteConfig?.consumeNewlyRegisterablePushAppIds(),
+                      !newlyRegisterable.isEmpty
+                else {
+                    return
+                }
+                // Mark the one-time upgrade recovery done only after the handler has durably cleared
+                // any delivered marker, so a crash in between re-runs recovery instead of stranding.
+                self.pushSubscriptionHandler?.onPushAppIdsChanged(newlyRegisterable) { [weak self] in
+                    self?.remoteConfig?.markPushAppIdsMigrated()
+                }
+            }
+
+            optOutLock.withLock {
+                // Skipped when the layer above the SDK keeps its own consent store: config.optOut is
+                // the truth, and a value this SDK stored on an earlier launch must not outrank it.
+                if config.persistOptOut {
+                    let optOut = theStorage.getBool(forKey: .optOut)
+                    config.optOut = optOut ?? config.optOut
+                }
+            }
+
+            // Snapshot resource attributes once so post-setup mutations of
+            // `config.logs.resourceAttributes` aren't honored — matches the
+            // doc contract on `TxlemetryLogsConfig`.
+            let logsResourceAttributes = TxlemetryLogsOTLP.buildResourceAttributes(config.logs)
+            let logsEndpoint = QueueEndpoint<TxlemetryLogRecord>.logs(
+                api: api,
+                resourceAttributes: logsResourceAttributes
+            )
+
+            #if !os(watchOS)
+                queue = TxlemetryQueue(config, theStorage, .batch(api: api), reachability)
+                replayQueue = TxlemetryReplayQueue(config, theStorage, api, reachability)
+                logsQueue = TxlemetryQueue(config, theStorage, logsEndpoint, reachability)
+            #else
+                queue = TxlemetryQueue(config, theStorage, .batch(api: api))
+                replayQueue = TxlemetryReplayQueue(config, theStorage, api)
+                logsQueue = TxlemetryQueue(config, theStorage, logsEndpoint)
+            #endif
+
+            queue?.start(disableReachabilityForTesting: config.disableReachabilityForTesting,
+                         disableQueueTimerForTesting: config.disableQueueTimerForTesting)
+
+            replayQueue?.start(disableReachabilityForTesting: config.disableReachabilityForTesting,
+                               disableQueueTimerForTesting: config.disableQueueTimerForTesting)
+
+            logsQueue?.start(disableReachabilityForTesting: config.disableReachabilityForTesting,
+                             disableQueueTimerForTesting: config.disableQueueTimerForTesting)
+
+            // Create session manager instance for this TxlemetrySDK instance
+            sessionManager.setup(config: config)
+            sessionManager.startSession()
+            // Listen for session changes to update crash context
+            sessionIdChangedToken = sessionManager.onSessionIdChanged.subscribe { [weak self] in
+                self?.notifyContextDidChange()
+            }
+
+            logger = TxlemetryLogger(sdk: self)
+
+            // Reconcile an identified bootstrap against an existing local identity BEFORE
+            // installing integrations. The app-lifecycle integration can replay
+            // didFinishLaunching synchronously on install and capture Application
+            // Installed/Updated, so the identify() merge has to run first for those early
+            // events to carry the bootstrapped identity. Runs inside setupLock (recursive, so
+            // identify()'s own setupLock reads are safe re-entrancy), after enabled/queue/
+            // remoteConfig are ready. A fresh install is already seeded in TxlemetryStorageManager;
+            // this only reconciles an existing local identity.
+            reconcileBootstrapIdentityIfNeeded()
+
+            if !config.optOut {
+                // don't install integrations if in opt-out state
+                installIntegrations()
+
+                createExceptionStepsBufferIfNeeded()
+
+                // Notify the integrations of the initial event context and buffered steps for crash reporting.
+                notifyContextDidChange()
+                notifyExceptionStepsDidChange()
+            }
+
+            #if os(iOS) || os(macOS)
+                // Releases a prewarm this setup turns out not to want — including while opted out,
+                // where the integrations above were never installed and so could never release it.
+                if #available(iOS 14.0, macOS 11.0, *) {
+                    if !config.installsPushNotificationOpenIntegration {
+                        DI.main.pushNotificationPublisher.discardPrewarmedNotificationResponseCapture()
+                    }
+                }
+            #endif
+
+            // Next-launch retry for a persisted, not-yet-delivered push subscription (no-ops while
+            // offline or when the record was already delivered). While opted out it unregisters a
+            // still-delivered record instead, covering `config.optOut = true` set before `setup()`.
+            pushSubscriptionHandler?.retryIfNeeded()
+
+            // Flush the queue when the app enters background to ensure
+            // pending events are sent before the app is suspended
+            if !config.disableFlushOnBackgroundForTesting {
+                didEnterBackgroundToken = DI.main.appLifecyclePublisher.onDidEnterBackground.subscribe { [weak self] in
+                    self?.flush()
+                }
+            }
+
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: TxlemetrySDK.didStartNotification, object: nil)
+            }
+        }
+    }
+
+    /// Browser-style reconciliation for an identified bootstrap (`isIdentifiedId == true`), matching
+    /// txlemetry-js: upgrade a matching anonymous id to identified without re-linking, merge a differing
+    /// anonymous user into the bootstrapped identity, or preserve a different already-identified user
+    /// and warn. Identity is persisted even while opted out (only event emission is suppressed).
+    private func reconcileBootstrapIdentityIfNeeded() {
+        guard let bootstrap = config.bootstrap, bootstrap.isIdentifiedId,
+              let bootstrapId = bootstrap.distinctId,
+              !bootstrapId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let storageManager = config.storageManager
+        else {
+            return
+        }
+
+        if storageManager.getDistinctId() == bootstrapId {
+            // Same id: only the identified state needs upgrading. No identify() and no $identify
+            // event, since the distinct id is unchanged. Persists even while opted out.
+            if !storageManager.isIdentified() {
+                storageManager.setIdentified(true)
+            }
+            return
+        }
+
+        // Differing id.
+        if storageManager.isIdentified() {
+            hedgeLog("Bootstrap distinctId differs from an already-identified user. The existing " +
+                "identity is preserved. Call reset() before reinitializing to switch users.")
+        } else if isOptOutState() {
+            // Opted out: identify() would return early without persisting, so write the identity
+            // directly to survive a later opt-in. Keep identify()'s personProfiles == .never gate,
+            // so opt-out never changes whether the bootstrap identity is written.
+            if config.personProfiles != .never {
+                storageManager.setDistinctId(bootstrapId)
+                storageManager.setIdentified(true)
+            }
+        } else {
+            // Existing anonymous user: merge it into the identified bootstrap ID via identify(),
+            // which no-ops when personProfiles == .never. The fresh-install path
+            // (TxlemetryStorageManager.applyBootstrapIdentityIfNeeded) instead seeds the identity
+            // directly, so under .never a returning anonymous user drops the bootstrap identity while a
+            // fresh install keeps it. That asymmetry is intentional txlemetry-js parity: the browser SDK
+            // reconciles the same paths through a gated identify() vs an ungated register().
+            identify(bootstrapId)
+        }
+    }
+
+    /// Returns the current Txlemetry distinct ID.
+    ///
+    /// Before `identify(_:)`, this is the anonymous ID. After identify, this is the identified user's ID.
+    ///
+    /// - Returns: The current distinct ID, or an empty string when the SDK is not set up.
+    @objc public func getDistinctId() -> String {
+        getStorageManagerValue { $0.getDistinctId() }
+    }
+
+    /// Returns the anonymous ID generated for this install.
+    ///
+    /// - Returns: The anonymous ID, or an empty string when the SDK is not set up.
+    @objc public func getAnonymousId() -> String {
+        getStorageManagerValue { $0.getAnonymousId() }
+    }
+
+    /// Returns the stable device identifier used for device-level feature flag bucketing.
+    ///
+    /// This ID persists across `identify()` and `reset()` calls, only changing on a fresh
+    /// app install, manual cache clearing, or OS-initiated storage cleanup.
+    ///
+    /// - Returns: The stable device ID, or an empty string when the SDK is not set up.
+    @objc public func getDeviceId() -> String {
+        getStorageManagerValue { $0.getDeviceId() }
+    }
+
+    private func getStorageManagerValue(_ value: (TxlemetryStorageManager) -> String) -> String {
+        guard isEnabled(), let storageManager = config.storageManager else {
+            return ""
+        }
+
+        return value(storageManager)
+    }
+
+    /// Returns the current session ID without rotating or creating a session.
+    ///
+    /// - Returns: The current session ID, or `nil` if no session is active or the SDK is not set up.
+    @objc public func getSessionId() -> String? {
+        if !isEnabled() {
+            return nil
+        }
+
+        return sessionManager.getSessionId(readOnly: true)
+    }
+
+    /// Starts or resumes the current analytics session.
+    @objc public func startSession() {
+        performWhenEnabled {
+            sessionManager.startSession()
+        }
+    }
+
+    /// Ends the current analytics session.
+    @objc public func endSession() {
+        performWhenEnabled {
+            sessionManager.endSession()
+        }
+    }
+
+    private func performWhenEnabled(_ action: () -> Void) {
+        guard isEnabled() else {
+            return
+        }
+
+        action()
+    }
+
+    // DEEP LINKS
+
+    /// Manually capture a deep link opened event.
+    ///
+    /// - Parameters:
+    ///   - url: The URL that was opened.
+    ///   - referrer: The referrer that triggered the deep link (optional).
+    @objc private func captureDeepLink(url: URL?, referrer: String? = nil) {
+        if !isEnabled() {
+            return
+        }
+
+        guard let url else { return }
+
+        let properties = TxlemetryDeepLinkHelper.buildDeepLinkProperties(url: url, referrer: referrer)
+
+        capture("Deep Link Opened", properties: properties)
+    }
+
+    /// Captures a deep link opened event for a URL.
+    ///
+    /// - Parameter url: The URL that was opened.
+    @objc public func captureDeepLink(url: URL) {
+        captureDeepLink(url: url as URL?, referrer: nil)
+    }
+
+    #if os(iOS) || os(tvOS) || os(macOS)
+        /// Capture deep link events from an array of URLs.
+        ///
+        /// Use this method with macOS `NSApplicationDelegate.application(_:open:)`.
+        /// File URLs are automatically filtered out; every other URL in the array is captured.
+        ///
+        /// - Parameter urls: The URLs that were opened.
+        @objc public func captureDeepLink(urls: [URL]) {
+            for url in urls where !url.isFileURL {
+                captureDeepLink(url: url)
+            }
+        }
+
+        /// Capture a deep link from an NSUserActivity (universal links).
+        ///
+        /// Use this method with `application(_:continue:restorationHandler:)` in your
+        /// app delegate, or with SwiftUI's `.onContinueUserActivity()` modifier.
+        /// Only activities of type `NSUserActivityTypeBrowsingWeb` are processed.
+        ///
+        /// - Parameter userActivity: The user activity containing the universal link.
+        @objc public func captureDeepLink(userActivity: NSUserActivity) {
+            if userActivity.activityType == NSUserActivityTypeBrowsingWeb, let url = userActivity.webpageURL {
+                captureDeepLink(url: url, referrer: userActivity.referrerURL?.absoluteString)
+            }
+        }
+    #endif
+
+    #if os(iOS) || os(tvOS)
+        /// Capture a deep link with UIKit open URL options.
+        ///
+        /// Use this method with `application(_:open:options:)` in your UIApplicationDelegate.
+        /// The source application is extracted as the referrer.
+        ///
+        /// - Parameters:
+        ///   - url: The URL that was opened.
+        ///   - options: The options dictionary from UIKit containing source application info.
+        @objc public func captureDeepLink(url: URL, options: [UIApplication.OpenURLOptionsKey: Any]) {
+            let referrer = options[.sourceApplication] as? String
+            captureDeepLink(url: url, referrer: referrer)
+        }
+
+        /// Capture a deep link from UIKit scene-based URL contexts.
+        ///
+        /// Use this method with `scene(_:openURLContexts:)` in your UISceneDelegate.
+        /// Only the first URL context is captured.
+        ///
+        /// - Parameter openURLContexts: The set of URL contexts from the scene delegate.
+        @available(iOS 13.0, tvOS 13.0, *)
+        @objc public func captureDeepLink(openURLContexts: Set<UIOpenURLContext>) {
+            if let context = openURLContexts.first {
+                captureDeepLink(url: context.url, referrer: context.options.sourceApplication)
+            }
+        }
+    #endif
+
+    // EVENT CAPTURE
+
+    private func dynamicContext() -> [String: Any] {
+        var properties = getRegisteredProperties()
+
+        var groups: [String: String]?
+        groupsLock.withLock {
+            groups = getGroups()
+        }
+        if groups != nil, !groups!.isEmpty {
+            properties["$groups"] = groups!
+        }
+
+        guard let flags = remoteConfig?.getFeatureFlags() as? [String: Any] else {
+            return properties
+        }
+
+        var keys: [String] = []
+        for (key, value) in flags {
+            properties["$feature/\(key)"] = value
+
+            var active = true
+            let boolValue = value as? Bool
+            if boolValue != nil {
+                active = boolValue!
+            } else {
+                active = true
+            }
+
+            if active {
+                keys.append(key)
+            }
+        }
+
+        if !keys.isEmpty {
+            properties["$active_feature_flags"] = keys
+        }
+
+        return properties
+    }
+
+    private func hasPersonProcessing() -> Bool {
+        !(
+            config.personProfiles == .never ||
+                (
+                    config.personProfiles == .identifiedOnly &&
+                        config.storageManager?.isIdentified() == false &&
+                        config.storageManager?.isPersonProcessing() == false
+                )
+        )
+    }
+
+    @discardableResult
+    private func requirePersonProcessing(functionName: String = #function) -> Bool {
+        if config.personProfiles == .never {
+            hedgeLog("\(functionName) was called, but `personProfiles` is set to `never`. This call will be ignored.")
+            return false
+        }
+        config.storageManager?.setPersonProcessing(true)
+        return true
+    }
+
+    /// `$sdk_debug_session_start` / `$sdk_debug_current_session_duration` / `$sdk_debug_pending_queue_size`.
+    /// `at` is the event's resolved time, the same instant the session was resolved against: a
+    /// backdated capture that rotates the session reports 0, not the size of the backdate (js
+    /// measures against the latest snapshot's timestamp too). Clamped, since a backdated event
+    /// that doesn't rotate can predate the live session's start.
+    private func sessionDebugProperties(at eventTime: Date) -> [String: Any] {
+        var props: [String: Any] = [:]
+        if let sessionStart = sessionManager.sessionStartTimestampSnapshot {
+            let elapsed = eventTime.timeIntervalSince1970 - sessionStart
+            props["$sdk_debug_session_start"] = Int64(sessionStart * 1000)
+            props["$sdk_debug_current_session_duration"] = Int64(max(0, elapsed) * 1000)
+        }
+        if let depth = queue?.depth {
+            props["$sdk_debug_pending_queue_size"] = depth
+        }
+        return props
+    }
+
+    private func buildProperties(distinctId: String,
+                                 properties: [String: Any]?,
+                                 userProperties: [String: Any]? = nil,
+                                 userPropertiesSetOnce: [String: Any]? = nil,
+                                 groups: [String: String]? = nil,
+                                 appendSharedProps: Bool = true,
+                                 timestamp: Date? = nil,
+                                 // Snapshot callers pass true: resolving the session read-only keeps a
+                                 // background crash-context refresh from rotating an idle session.
+                                 readOnlySession: Bool = false) -> [String: Any]
+    {
+        var props: [String: Any] = [:]
+
+        // Resolve the session before any $sdk_debug_* snapshot below: getSessionId(at:) can rotate
+        // here, so the debug keys must describe the session this event lands in (mirrors txlemetry-js).
+        // A caller-supplied $session_id wins so replay snapshots never land in the wrong session.
+        let eventTime = timestamp ?? now()
+        let propSessionId = properties?["$session_id"] as? String
+        let sessionId: String? = propSessionId.isNilOrEmpty
+            ? sessionManager.getSessionId(at: eventTime, readOnly: readOnlySession)
+            : propSessionId
+
+        if appendSharedProps {
+            let staticCtx = context?.staticContext()
+            let dynamicCtx = context?.dynamicContext()
+            let localDynamicCtx = dynamicContext()
+
+            if staticCtx != nil {
+                props = props.merging(staticCtx ?? [:]) { current, _ in current }
+            }
+            if dynamicCtx != nil {
+                props = props.merging(dynamicCtx ?? [:]) { current, _ in current }
+            }
+            props = props.merging(localDynamicCtx) { current, _ in current }
+            if userProperties != nil {
+                props["$set"] = (userProperties ?? [:])
+            }
+            if userPropertiesSetOnce != nil {
+                props["$set_once"] = (userPropertiesSetOnce ?? [:])
+            }
+            if groups != nil {
+                // $groups are also set via the dynamicContext
+                let currentGroups = props["$groups"] as? [String: String] ?? [:]
+                let mergedGroups = currentGroups.merging(groups ?? [:]) { current, _ in current }
+                props["$groups"] = mergedGroups
+            }
+
+            if let isIdentified = config.storageManager?.isIdentified() {
+                props["$is_identified"] = isIdentified
+            }
+
+            props["$process_person_profile"] = hasPersonProcessing()
+
+            // SDK-computed debug keys overwrite a same-named registered super property (js: `extend`
+            // after super properties), so a stale `register()` can't shadow the live status.
+            #if os(iOS)
+                if let replayIntegration {
+                    props.merge(replayIntegration.debugProperties()) { _, new in new }
+                } else {
+                    props["$recording_status"] = "disabled"
+                    props["$sdk_debug_replay_capture_mode"] = TxlemetryReplayIntegration.captureMode(config: config)
+                    props["$sdk_debug_replay_throttle_delay_ms"] = TxlemetryReplayIntegration.throttleDelayMs(config: config)
+                }
+            #else
+                props["$recording_status"] = "disabled"
+            #endif
+            props.merge(sessionDebugProperties(at: eventTime)) { _, new in new }
+
+            // Only stamp if the caller didn't supply a non-empty value —
+            // `merging(properties)` below keeps the existing value on conflict,
+            // so seeding would shadow a caller-supplied override. Whitespace-only
+            // caller values are treated as absent (almost always accidental).
+            let trimmedCallerScreenName = (properties?["$screen_name"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let name = lastScreenName, !name.isEmpty, trimmedCallerScreenName.isNilOrEmpty {
+                props["$screen_name"] = name
+            }
+        }
+
+        let sdkInfo = context?.sdkInfo()
+        if sdkInfo != nil {
+            props = props.merging(sdkInfo ?? [:]) { current, _ in current }
+        }
+
+        if let sessionId {
+            if propSessionId.isNilOrEmpty {
+                props["$session_id"] = sessionId
+            }
+            // only Session replay requires $window_id, so we set as the same as $session_id.
+            // the backend might fallback to $session_id if $window_id is not present next.
+            #if os(iOS)
+                if !appendSharedProps, isSessionReplayActive() {
+                    props["$window_id"] = sessionId
+                }
+            #endif
+        }
+
+        // only Session Replay needs distinct_id also in the props
+        // remove after https://github.com/Txlemetry/txlemetry/issues/23275 gets merged
+        let propDistinctId = properties?["distinct_id"] as? String
+        if !appendSharedProps, propDistinctId == nil || propDistinctId?.isEmpty == true {
+            props["distinct_id"] = distinctId
+        }
+
+        let callerProps = properties ?? [:]
+        props = props.merging(callerProps) { current, _ in current }
+        // Caller-supplied feature-flag properties take precedence over the cached values
+        let callerFlagProps = callerProps.filter { $0.key.hasPrefix("$feature/") || $0.key == "$active_feature_flags" }
+        props = props.merging(callerFlagProps) { _, new in new }
+
+        return props
+    }
+
+    /// Trigger an immediate flush of every queue — events, session-replay
+    /// snapshots, and structured logs.
+    @objc public func flush() {
+        if !isEnabled() {
+            return
+        }
+
+        queue?.flush()
+        replayQueue?.flush()
+        logsQueue?.flush()
+        pushSubscriptionHandler?.retryIfNeeded()
+    }
+
+    func surveyEventDistinctId(generation: String?) -> String? {
+        guard let storage else { return nil }
+        let snapshot = storage.withSurveyState { currentGeneration -> (epoch: String, distinctId: String?)? in
+            guard generation == nil || generation == currentGeneration,
+                  storage.isSurveyGenerationCurrent(currentGeneration) else { return nil }
+            if surveyIdentityGeneration != currentGeneration {
+                config.storageManager?.reset()
+                surveyIdentityGeneration = currentGeneration
+            }
+            return (currentGeneration, storage.getString(forKey: .distinctId) ?? storage.getString(forKey: .anonymousId))
+        }
+        guard let snapshot else { return nil }
+        if let distinctId = snapshot.distinctId { return distinctId }
+        // Identity generation may call user code, so it cannot hold the shared file lock.
+        _ = getDistinctId()
+        return storage.withSurveyState { currentGeneration in
+            guard currentGeneration == snapshot.epoch else { return nil }
+            return storage.getString(forKey: .distinctId) ?? storage.getString(forKey: .anonymousId)
+        }
+    }
+
+    /// Resets local identity, super properties, feature flag cache, and session state.
+    ///
+    /// Call this when a user logs out. The next captured event will use a new anonymous identity
+    /// unless `TxlemetryConfig.reuseAnonymousId` is enabled. If a push token is registered, it is
+    /// unregistered for the logged-out identity and re-registered under the new anonymous id.
+    @objc public func reset() {
+        if !isEnabled() {
+            return
+        }
+
+        // Snapshot the push token + old identity BEFORE storage is cleared, so it can be unregistered
+        // for the logged-out user and re-registered under the new anonymous id (decision 5/6).
+        let pushResetContext: (oldDistinctId: String, deviceToken: String, appId: String)?
+        if let record = pushSubscriptionHandler?.recordForReset() {
+            pushResetContext = (getDistinctId(), record.deviceToken, record.appId)
+        } else {
+            pushResetContext = nil
+        }
+
+        // storage also removes all feature flags
+        if let storage {
+            storage.withSurveyState { _ in
+                storage.reset(keepAnonymousId: config.reuseAnonymousId)
+                config.storageManager?.reset(keepAnonymousId: config.reuseAnonymousId)
+            }
+        }
+        flagCallReportedLock.withLock {
+            flagCallReported.removeAll()
+        }
+        sessionManager.reset()
+
+        // Clear all in-memory caches (feature flags, session replay state, etc.)
+        remoteConfig?.clear()
+
+        lastScreenLock.withLock { _lastScreenName = nil }
+
+        // reload flags as anon user
+        remoteConfig?.reloadFeatureFlags()
+
+        // Notify integrations of context change (e.g., for crash reporting)
+        notifyContextDidChange()
+
+        if let ctx = pushResetContext {
+            // Only unregister the old identity when it actually changed. When reset() keeps the same id
+            // (reuseAnonymousId on an anonymous user), the DELETE would unregister the very id we
+            // re-register under — and race the re-register on the same person.
+            if ctx.oldDistinctId != getDistinctId() {
+                pushSubscriptionHandler?.unregister(distinctId: ctx.oldDistinctId, deviceToken: ctx.deviceToken, appId: ctx.appId)
+            }
+            pushSubscriptionHandler?.reregisterAfterReset(deviceToken: ctx.deviceToken, appId: ctx.appId)
+        }
+    }
+
+    private func getGroups() -> [String: String] {
+        guard let groups = storage?.getDictionary(forKey: .groups) as? [String: String] else {
+            return [:]
+        }
+        return groups
+    }
+
+    private func getRegisteredProperties() -> [String: Any] {
+        guard let props = storage?.getDictionary(forKey: .registerProperties) as? [String: Any] else {
+            return [:]
+        }
+        return props
+    }
+
+    // register is a reserved word in ObjC
+    /// Registers super properties that are included with every subsequent event.
+    ///
+    /// New values overwrite existing values for the same keys and persist across app restarts
+    /// until removed with `unregister(_:)` or cleared by `reset()`.
+    ///
+    /// - Parameter properties: Event properties to persist and attach to future captures.
+    @objc(registerProperties:)
+    public func register(_ properties: [String: Any]) {
+        if !isEnabled() {
+            return
+        }
+
+        let sanitizedProps = sanitizeDictionary(properties)
+        if sanitizedProps == nil {
+            return
+        }
+
+        personPropsLock.withLock {
+            let props = getRegisteredProperties()
+            let mergedProps = props.merging(sanitizedProps!) { _, new in new }
+            storage?.setDictionary(forKey: .registerProperties, contents: mergedProps)
+        }
+
+        // Notify integrations of context change (e.g., for crash reporting)
+        notifyContextDidChange()
+    }
+
+    /// Removes a previously registered super property.
+    ///
+    /// - Parameter key: The property key to stop attaching to future events.
+    @objc(unregisterProperties:)
+    public func unregister(_ key: String) {
+        if !isEnabled() {
+            return
+        }
+
+        personPropsLock.withLock {
+            var props = getRegisteredProperties()
+            props.removeValue(forKey: key)
+            storage?.setDictionary(forKey: .registerProperties, contents: props)
+        }
+
+        // Notify integrations of context change (e.g., for crash reporting)
+        notifyContextDidChange()
+    }
+
+    /// Identifies the current user with a stable distinct ID.
+    ///
+    /// By default, the first successful identify call links prior anonymous events to the provided ID.
+    /// If `TxlemetryConfig.reuseAnonymousId` is `true`, prior anonymous events are not linked.
+    /// Empty IDs, opted-out users, and configurations with `personProfiles == .never` are ignored.
+    ///
+    /// - Parameter distinctId: Stable user identifier from your application.
+    @objc public func identify(_ distinctId: String) {
+        identify(distinctId, userProperties: nil, userPropertiesSetOnce: nil)
+    }
+
+    /// Identifies the current user and sets person properties.
+    ///
+    /// - Parameters:
+    ///   - distinctId: Stable user identifier from your application.
+    ///   - userProperties: Properties to set on the person profile. Existing values are overwritten.
+    @objc(identifyWithDistinctId:userProperties:)
+    public func identify(_ distinctId: String,
+                         userProperties: [String: Any]? = nil)
+    {
+        identify(distinctId, userProperties: userProperties, userPropertiesSetOnce: nil)
+    }
+
+    /// Identifies the current user and sets person properties.
+    ///
+    /// - Parameters:
+    ///   - distinctId: Stable user identifier from your application.
+    ///   - userProperties: Properties to set on the person profile. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Properties to set only if they do not already exist.
+    @objc(identifyWithDistinctId:userProperties:userPropertiesSetOnce:)
+    public func identify(_ distinctId: String,
+                         userProperties: [String: Any]? = nil,
+                         userPropertiesSetOnce: [String: Any]? = nil)
+    {
+        if !isEnabled() {
+            return
+        }
+
+        if distinctId.isEmpty {
+            hedgeLog("identify call not allowed, distinctId is invalid: \(distinctId)")
+            return
+        }
+
+        if isOptOutState() {
+            return
+        }
+
+        if !requirePersonProcessing() {
+            return
+        }
+
+        guard let queue, let storageManager = config.storageManager else {
+            return
+        }
+        let oldDistinctId = getDistinctId()
+
+        var isIdentified = false
+        var hasDifferentDistinctId = false
+        var shouldTransitionToIdentified = false
+
+        // Read isIdentified, decide the transition, and persist it atomically so two
+        // concurrent identify() calls on an anonymous user can't both see isIdentified
+        // == false and each emit a person-processed event for the same transition.
+        // Read before taking identifyLock: `config`'s getter takes setupLock, and setup() holds
+        // setupLock while reaching identify(), so reading it inside would invert the two.
+        let reuseAnonymousId = config.reuseAnonymousId
+        identifyLock.withLock {
+            isIdentified = storageManager.isIdentified()
+            hasDifferentDistinctId = distinctId != oldDistinctId
+            shouldTransitionToIdentified = !hasDifferentDistinctId && !isIdentified
+
+            if hasDifferentDistinctId, !isIdentified {
+                if !reuseAnonymousId {
+                    // We keep the AnonymousId to be used by flags calls and identify to link the previousId
+                    storageManager.setAnonymousId(oldDistinctId)
+                }
+                storageManager.setDistinctId(distinctId)
+                storageManager.setIdentified(true)
+            } else if shouldTransitionToIdentified {
+                storageManager.setIdentified(true)
+            }
+        }
+
+        if hasDifferentDistinctId, !isIdentified {
+            var props: [String: Any] = ["distinct_id": distinctId]
+
+            if !config.reuseAnonymousId {
+                props["$anon_distinct_id"] = oldDistinctId
+            }
+
+            let properties = buildProperties(
+                distinctId: distinctId,
+                properties: props,
+                userProperties: sanitizeDictionary(userProperties),
+                userPropertiesSetOnce: sanitizeDictionary(userPropertiesSetOnce)
+            )
+
+            guard let event = buildEvent(event: TxlemetryKnownUnsafeEditableEvent.identify.rawValue, distinctId: distinctId, properties: properties) else {
+                return
+            }
+
+            // Automatically set person properties for feature flags during identify() call
+            setPersonPropertiesForFlagsIfNeeded(userProperties, userPropertiesSetOnce: userPropertiesSetOnce)
+
+            queueEvent(event, queue: queue)
+
+            remoteConfig?.reloadFeatureFlags()
+
+            // Notify integrations of context change (e.g., for crash reporting)
+            notifyContextDidChange()
+
+            // we need to make sure the user props update is for the same user
+            // otherwise they have to reset and identify again
+        } else if shouldTransitionToIdentified {
+            // Matching id while still anonymous (e.g. a non-identified bootstrap seeded the same
+            // id): upgrade to identified and emit one person-processed $set — there is no
+            // anonymous id to merge, so no $identify (matches txlemetry-js).
+            // setIdentified(true) already performed above under identifyLock.
+
+            setPersonPropertiesForFlagsIfNeeded(userProperties, userPropertiesSetOnce: userPropertiesSetOnce)
+
+            capture(TxlemetryKnownUnsafeEditableEvent.set.rawValue,
+                    distinctId: distinctId,
+                    userProperties: userProperties,
+                    userPropertiesSetOnce: userPropertiesSetOnce)
+
+            // The identified state itself is not part of the flags request; reload only when the
+            // caller supplied properties that can affect flag evaluation.
+            if !(userProperties?.isEmpty ?? true) || !(userPropertiesSetOnce?.isEmpty ?? true) {
+                remoteConfig?.reloadFeatureFlags()
+            }
+
+            notifyContextDidChange()
+        } else if !hasDifferentDistinctId, !(userProperties?.isEmpty ?? true) || !(userPropertiesSetOnce?.isEmpty ?? true) {
+            captureInternal(TxlemetryKnownUnsafeEditableEvent.set.rawValue,
+                            distinctId: distinctId,
+                            userProperties: userProperties,
+                            userPropertiesSetOnce: userPropertiesSetOnce,
+                            deduplicatePersonProperties: true)
+
+            // Automatically set person properties for feature flags during user property updates
+            setPersonPropertiesForFlagsIfNeeded(userProperties, userPropertiesSetOnce: userPropertiesSetOnce)
+
+            // Note we don't reload flags on property changes as these get processed async
+
+        } else {
+            hedgeLog("already identified with id: \(oldDistinctId)")
+        }
+    }
+
+    /// Sets properties on the person profile associated with the current distinct_id.
+    ///
+    /// Updates user properties that are stored with the person profile in Txlemetry.
+    /// If `personProfiles` is set to `never`, this call will be ignored.
+    ///
+    /// This method sends a `$set` event to Txlemetry.
+    ///
+    /// - Parameters:
+    ///   - userPropertiesToSet: Properties to store about the user. These will overwrite existing values.
+    @objc(setPersonPropertiesWithUserPropertiesToSet:)
+    public func setPersonProperties(
+        userPropertiesToSet: [String: Any]?
+    ) {
+        setPersonProperties(userPropertiesToSet: userPropertiesToSet, userPropertiesToSetOnce: nil)
+    }
+
+    /// Sets properties on the person profile associated with the current distinct_id.
+    ///
+    /// Updates user properties that are stored with the person profile in Txlemetry.
+    /// If `personProfiles` is set to `never`, this call will be ignored.
+    ///
+    /// This method sends a `$set` event to Txlemetry.
+    ///
+    /// - Parameters:
+    ///   - userPropertiesToSet: Properties to store about the user. These will overwrite existing values.
+    ///   - userPropertiesToSetOnce: Properties to store about the user only if not previously set.
+    ///     Note: For feature flag evaluations, if the same key is present in both parameters,
+    ///     the value from userPropertiesToSet will take precedence.
+    @objc(setPersonPropertiesWithUserPropertiesToSet:userPropertiesToSetOnce:)
+    public func setPersonProperties(
+        userPropertiesToSet: [String: Any]?,
+        userPropertiesToSetOnce: [String: Any]?
+    ) {
+        if !isEnabled() {
+            return
+        }
+
+        if userPropertiesToSet?.isEmpty ?? true, userPropertiesToSetOnce?.isEmpty ?? true {
+            return
+        }
+
+        if !requirePersonProcessing() {
+            return
+        }
+
+        let currentDistinctId = getDistinctId()
+
+        // Update person properties for flags (setOnce properties are applied first, then set properties override)
+        var allProperties: [String: Any] = [:]
+        if let userPropertiesToSetOnce {
+            allProperties.merge(userPropertiesToSetOnce) { _, new in new }
+        }
+        if let userPropertiesToSet {
+            allProperties.merge(userPropertiesToSet) { _, new in new }
+        }
+        if !allProperties.isEmpty {
+            setPersonPropertiesForFlags(allProperties, reloadFeatureFlags: false)
+        }
+
+        // Send the $set event
+        captureInternal(
+            TxlemetryKnownUnsafeEditableEvent.set.rawValue,
+            distinctId: currentDistinctId,
+            userProperties: userPropertiesToSet,
+            userPropertiesSetOnce: userPropertiesToSetOnce,
+            deduplicatePersonProperties: true
+        )
+    }
+
+    /// Computes a hash for deduplicating person properties calls.
+    private func getPersonPropertiesHash(
+        distinctId: String,
+        userPropertiesToSet: [String: Any]?,
+        userPropertiesToSetOnce: [String: Any]?
+    ) -> String {
+        var hashData: [String: Any] = ["distinct_id": distinctId]
+
+        // Sanitize each dictionary on its own, the same way `capture` does. `sanitizeDictionary`
+        // only converts Date/URL at the top level, so a raw dictionary nested under `hashData`
+        // would be dropped whole and unrelated property sets would share one hash.
+        if let userPropertiesToSet = sanitizeDictionary(userPropertiesToSet) {
+            hashData["userPropertiesToSet"] = userPropertiesToSet
+        }
+        if let userPropertiesToSetOnce = sanitizeDictionary(userPropertiesToSetOnce) {
+            hashData["userPropertiesToSetOnce"] = userPropertiesToSetOnce
+        }
+
+        // .sortedKeys option handles recursive key sorting for deterministic hashing
+        if let jsonData = toJSONData(hashData, options: [.sortedKeys]),
+           let jsonString = String(data: jsonData, encoding: .utf8)
+        {
+            return jsonString
+        }
+
+        // fallback
+        return hashData.description
+    }
+
+    private func isOptOutState() -> Bool {
+        if config.optOut {
+            hedgeLog("Txlemetry is in OptOut state.")
+            return true
+        }
+        return false
+    }
+
+    /// Best-effort connectivity check for deferring push registration while offline.
+    /// Defaults to `true` when reachability isn't available (watchOS or disabled for testing).
+    private func isNetworkReachable() -> Bool {
+        #if !os(watchOS)
+            if config.disableReachabilityForTesting {
+                return true
+            }
+            guard let reachability else { return true }
+            if case .unavailable = reachability.connection {
+                return false
+            }
+            return true
+        #else
+            return true
+        #endif
+    }
+
+    private func setPersonPropertiesForFlagsIfNeeded(
+        _ userProperties: [String: Any]?,
+        userPropertiesSetOnce: [String: Any]? = nil
+    ) {
+        let sanitizedUserProperties = sanitizeDictionary(userProperties) ?? [:]
+        let sanitizedUserPropertiesSetOnce = sanitizeDictionary(userPropertiesSetOnce) ?? [:]
+
+        // Combine both types of properties for feature flag evaluation
+        let allProperties = sanitizedUserProperties.merging(sanitizedUserPropertiesSetOnce) { current, _ in current }
+
+        guard !allProperties.isEmpty else {
+            return
+        }
+
+        remoteConfig?.setPersonPropertiesForFlags(allProperties)
+    }
+
+    private func setGroupPropertiesForFlagsIfNeeded(
+        type: String,
+        groupProperties: [String: Any]?
+    ) {
+        let sanitizedGroupProperties = sanitizeDictionary(groupProperties) ?? [:]
+
+        guard !sanitizedGroupProperties.isEmpty else {
+            return
+        }
+
+        remoteConfig?.setGroupPropertiesForFlags(type, properties: sanitizedGroupProperties)
+    }
+
+    /// Returns fresh default device and app properties for feature flag evaluation.
+    /// This ensures feature flags can use current properties like $app_version, $os_version, etc.
+    /// These properties are computed fresh each time they're needed.
+    private func getDefaultPersonProperties() -> [String: Any] {
+        guard config.setDefaultPersonProperties else { return [:] }
+        guard isEnabled() else { return [:] }
+
+        return context?.personPropertiesContext() ?? [:]
+    }
+
+    /// Captures a custom event for the current user.
+    ///
+    /// - Parameter event: Event name to capture.
+    @objc public func capture(_ event: String) {
+        capture(event, distinctId: nil, properties: nil, userProperties: nil, userPropertiesSetOnce: nil, groups: nil)
+    }
+
+    /// Captures a custom event with event properties.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - properties: Event properties attached only to this event.
+    @objc(captureWithEvent:properties:)
+    public func capture(_ event: String,
+                        properties: [String: Any]? = nil)
+    {
+        capture(event, distinctId: nil, properties: properties, userProperties: nil, userPropertiesSetOnce: nil, groups: nil)
+    }
+
+    /// Captures a custom event and updates person properties.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
+    @objc(captureWithEvent:properties:userProperties:)
+    public func capture(_ event: String,
+                        properties: [String: Any]? = nil,
+                        userProperties: [String: Any]? = nil)
+    {
+        capture(event, distinctId: nil, properties: properties, userProperties: userProperties, userPropertiesSetOnce: nil, groups: nil)
+    }
+
+    /// Captures a custom event and updates person properties.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Person properties to set only if they do not already exist.
+    @objc(captureWithEvent:properties:userProperties:userPropertiesSetOnce:)
+    public func capture(_ event: String,
+                        properties: [String: Any]? = nil,
+                        userProperties: [String: Any]? = nil,
+                        userPropertiesSetOnce: [String: Any]? = nil)
+    {
+        capture(event, distinctId: nil, properties: properties, userProperties: userProperties, userPropertiesSetOnce: userPropertiesSetOnce, groups: nil)
+    }
+
+    /// Captures a custom event with group context.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Person properties to set only if they do not already exist.
+    ///   - groups: Group type/key pairs to attach to this event.
+    @objc(captureWithEvent:properties:userProperties:userPropertiesSetOnce:groups:)
+    public func capture(_ event: String,
+                        properties: [String: Any]? = nil,
+                        userProperties: [String: Any]? = nil,
+                        userPropertiesSetOnce: [String: Any]? = nil,
+                        groups: [String: String]? = nil)
+    {
+        capture(event, distinctId: nil, properties: properties, userProperties: userProperties, userPropertiesSetOnce: userPropertiesSetOnce, groups: groups)
+    }
+
+    /// Captures a custom event for an explicit distinct ID.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - distinctId: Optional distinct ID override. Defaults to the current SDK distinct ID.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Person properties to set only if they do not already exist.
+    ///   - groups: Group type/key pairs to attach to this event.
+    @objc(captureWithEvent:distinctId:properties:userProperties:userPropertiesSetOnce:groups:)
+    public func capture(_ event: String,
+                        distinctId: String? = nil,
+                        properties: [String: Any]? = nil,
+                        userProperties: [String: Any]? = nil,
+                        userPropertiesSetOnce: [String: Any]? = nil,
+                        groups: [String: String]? = nil)
+    {
+        capture(event,
+                distinctId: distinctId,
+                properties: properties,
+                userProperties: userProperties,
+                userPropertiesSetOnce: userPropertiesSetOnce,
+                groups: groups,
+                timestamp: nil)
+    }
+
+    /// Captures a custom event for an explicit distinct ID and timestamp.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - distinctId: Optional distinct ID override. Defaults to the current SDK distinct ID.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Person properties to set only if they do not already exist.
+    ///   - groups: Group type/key pairs to attach to this event.
+    ///   - timestamp: Optional event timestamp. Defaults to the current time. The absolute instant
+    ///     is serialized in UTC, regardless of the calendar or time zone used to create it.
+    @objc(captureWithEvent:distinctId:properties:userProperties:userPropertiesSetOnce:groups:timestamp:)
+    public func capture(_ event: String,
+                        distinctId: String? = nil,
+                        properties: [String: Any]? = nil,
+                        userProperties: [String: Any]? = nil,
+                        userPropertiesSetOnce: [String: Any]? = nil,
+                        groups: [String: String]? = nil,
+                        timestamp: Date? = nil)
+    {
+        captureInternal(
+            event,
+            distinctId: distinctId,
+            properties: properties,
+            userProperties: userProperties,
+            userPropertiesSetOnce: userPropertiesSetOnce,
+            groups: groups,
+            timestamp: timestamp,
+            skipBuildProperties: false
+        )
+    }
+
+    // MARK: - Logs capture
+
+    /// Capture a structured log record at `.info` severity.
+    ///
+    /// Log records ship to Txlemetry via a separate `/i/v1/logs` endpoint and
+    /// are persisted to disk so they survive app restarts. The call performs
+    /// a **synchronous disk write on the calling thread**, then the network
+    /// send happens asynchronously — same contract as `capture(_:)` for
+    /// events. Avoid calling from the main thread on hot paths. Records run
+    /// through `config.logs.beforeSend` and the per-window rate cap before
+    /// enqueueing — both can drop a record silently. An empty or
+    /// whitespace-only `body` is always dropped.
+    ///
+    /// - Parameter body: The log message. Required and non-empty.
+    @objc(captureLogWithBody:)
+    public func captureLog(_ body: String) {
+        captureLogInternal(body, level: .info, attributes: nil, traceId: nil, spanId: nil, traceFlags: nil)
+    }
+
+    /// Capture a structured log record at the given severity.
+    ///
+    /// - Parameters:
+    ///   - body: The log message. Required and non-empty.
+    ///   - level: Severity. Use `.trace`/`.debug` for diagnostic detail,
+    ///     `.info` for regular events, `.warn`/`.error`/`.fatal` for problems.
+    @objc(captureLogWithBody:level:)
+    public func captureLog(_ body: String, level: TxlemetryLogSeverity) {
+        captureLogInternal(body, level: level, attributes: nil, traceId: nil, spanId: nil, traceFlags: nil)
+    }
+
+    /// Capture a structured log record with caller-supplied attributes.
+    ///
+    /// - Parameters:
+    ///   - body: The log message. Required and non-empty.
+    ///   - level: Severity.
+    ///   - attributes: Per-record attributes (request id, duration, etc.).
+    ///     Values must be JSON-serializable; non-serializable entries are
+    ///     dropped.
+    @objc(captureLogWithBody:level:attributes:)
+    public func captureLog(_ body: String, level: TxlemetryLogSeverity, attributes: [String: Any]?) {
+        captureLogInternal(body, level: level, attributes: attributes, traceId: nil, spanId: nil, traceFlags: nil)
+    }
+
+    /// Capture a structured log record with W3C trace context. Intended for
+    /// callers correlating logs with distributed traces; most apps should use
+    /// the simpler overload.
+    ///
+    /// - Parameters:
+    ///   - body: The log message. Required and non-empty.
+    ///   - level: Severity.
+    ///   - attributes: Per-record attributes. Same rules as the simpler overload.
+    ///   - traceId: 32-character lowercase hex W3C trace id.
+    ///   - spanId: 16-character lowercase hex W3C span id.
+    ///   - traceFlags: W3C trace flags bitfield (bit 0 is the `sampled` flag).
+    ///     `nil` omits the field on the wire; `0` emits an explicit zero.
+    @objc(captureLogWithBody:level:attributes:traceId:spanId:traceFlags:)
+    public func captureLog(_ body: String,
+                           level: TxlemetryLogSeverity,
+                           attributes: [String: Any]?,
+                           traceId: String?,
+                           spanId: String?,
+                           traceFlags: NSNumber?)
+    {
+        captureLogInternal(body, level: level, attributes: attributes, traceId: traceId, spanId: spanId, traceFlags: traceFlags?.intValue)
+    }
+
+    /// Swift-native variant of `captureLog` with default values for every
+    /// argument except `body`. Most call sites can write `captureLog("...")`
+    /// or `captureLog("...", level: .warn, attributes: [...])`.
+    ///
+    /// - Parameters:
+    ///   - body: The log message. Required and non-empty.
+    ///   - level: Severity. Defaults to `.info`.
+    ///   - attributes: Per-record attributes. Values must be JSON-serializable.
+    ///   - traceId: Optional 32-character lowercase hex W3C trace ID.
+    ///   - spanId: Optional 16-character lowercase hex W3C span ID.
+    ///   - traceFlags: Optional W3C trace flags bitfield.
+    public func captureLog(_ body: String,
+                           level: TxlemetryLogSeverity = .info,
+                           attributes: [String: Any]? = nil,
+                           traceId: String? = nil,
+                           spanId: String? = nil,
+                           traceFlags: Int? = nil)
+    {
+        captureLogInternal(body, level: level, attributes: attributes, traceId: traceId, spanId: spanId, traceFlags: traceFlags)
+    }
+
+    private func captureLogInternal(_ body: String,
+                                    level: TxlemetryLogSeverity,
+                                    attributes: [String: Any]?,
+                                    traceId: String?,
+                                    spanId: String?,
+                                    traceFlags: Int?)
+    {
+        if !isEnabled() { return }
+        if isOptOutState() { return }
+        guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            hedgeLog("captureLog: empty body, dropping")
+            return
+        }
+        guard let logsQueue else { return }
+
+        // Capture-time context snapshot — cheap reads only, safe from any
+        // thread. Identity/session changes between capture and flush will not
+        // alter the record because the snapshot is frozen here.
+        let distinctId = getDistinctId()
+        let sessionId = sessionManager.getSessionId(readOnly: true)
+        let screenName = lastScreenName
+        let appState: TxlemetryLogRecord.AppState = sessionManager.isAppInBackgroundSnapshot ? .background : .foreground
+        let featureFlagKeys: [String] = (remoteConfig?.getFeatureFlags() as? [String: Any])?.compactMap { key, value in
+            // Bool flags are active iff true; multivariant (non-bool) values
+            // are always active.
+            if let boolValue = value as? Bool { return boolValue ? key : nil }
+            return key
+        }.sorted() ?? []
+
+        let nanos = nanosNow()
+        let record = TxlemetryLogRecord(
+            body: body,
+            level: level,
+            attributes: attributes ?? [:],
+            traceId: traceId,
+            spanId: spanId,
+            traceFlags: traceFlags.map { NSNumber(value: $0) },
+            timeUnixNano: nanos,
+            observedTimeUnixNano: nanos,
+            distinctId: distinctId.isEmpty ? nil : distinctId,
+            sessionId: sessionId,
+            screenName: screenName,
+            appState: appState.rawValue,
+            featureFlagKeys: featureFlagKeys
+        )
+
+        // `runBeforeSend` enforces the empty-body drop, so we don't need a
+        // post-callback check here.
+        guard let processed = config.logs.runBeforeSend(record) else { return }
+        logsQueue.add(processed)
+    }
+
+    /// Internal capture method that handles all event capture logic.
+    ///
+    /// - Parameters:
+    ///   - skipBuildProperties: When true, skips buildProperties call and uses properties as-is.
+    ///     Used by crash reporting to capture events with pre-built crash-time context.
+    func captureInternal(
+        _ event: String,
+        distinctId: String? = nil,
+        properties: [String: Any]? = nil,
+        userProperties: [String: Any]? = nil,
+        userPropertiesSetOnce: [String: Any]? = nil,
+        groups: [String: String]? = nil,
+        timestamp: Date? = nil,
+        skipBuildProperties: Bool = false,
+        propertyAllowlist: Set<String>? = nil,
+        deduplicatePersonProperties: Bool = false
+    ) {
+        if !isEnabled() {
+            return
+        }
+
+        if isOptOutState() {
+            return
+        }
+
+        guard let queue else {
+            return
+        }
+
+        // $exception_list only ever comes from the caller, so raw properties are sufficient here
+        if event == "$exception" {
+            let ignored = config.errorTrackingConfig.ignoredExceptionTypes
+            if !ignored.isEmpty,
+               TxlemetryErrorTrackingAutoCaptureIntegration.exceptionListMatchesIgnoredTypes(properties ?? [:], ignoredTypes: ignored)
+            {
+                hedgeLog("$exception skipped: exception type is in errorTrackingConfig.ignoredExceptionTypes")
+                return
+            }
+        }
+
+        var isSnapshotEvent = event == "$snapshot"
+        let eventTimestamp = timestamp ?? now()
+        let eventDistinctId = distinctId ?? getDistinctId()
+
+        // if the user isn't identified but passed userProperties, userPropertiesSetOnce or groups,
+        // we should still enable person processing since this is intentional
+        let hasPersonData = userProperties?.isEmpty == false
+            || userPropertiesSetOnce?.isEmpty == false
+            || groups?.isEmpty == false
+
+        if !skipBuildProperties, hasPersonData {
+            requirePersonProcessing()
+        }
+
+        var finalProperties: [String: Any]
+        if skipBuildProperties {
+            // Use properties as-is (already built at crash time)
+            finalProperties = properties ?? [:]
+        } else {
+            finalProperties = buildProperties(
+                distinctId: eventDistinctId,
+                properties: sanitizeDictionary(properties),
+                userProperties: sanitizeDictionary(userProperties),
+                userPropertiesSetOnce: sanitizeDictionary(userPropertiesSetOnce),
+                groups: groups,
+                appendSharedProps: !isSnapshotEvent,
+                timestamp: timestamp
+            )
+        }
+
+        // Filtering after the full build stays robust as new context properties are added later:
+        // anything not explicitly allowlisted is stripped. beforeSend hooks and the legacy
+        // propertiesSanitizer run later (in buildEvent) and may re-add keys — an accepted
+        // escape hatch, codified in the minimal-event contract.
+        if let propertyAllowlist {
+            finalProperties = finalProperties.filter { propertyAllowlist.contains($0.key) }
+        }
+
+        // Attach the session-scoped step buffer to a `$exception` unless the caller provided their own.
+        // The buffer is left intact; recording is synchronous, so a step added just before this capture
+        // on the same thread is already present.
+        let isExceptionEvent = event == "$exception" && !skipBuildProperties
+        if isExceptionEvent, finalProperties[TxlemetryExceptionStepFields.stepsKey] == nil,
+           let steps = attachableExceptionSteps
+        {
+            finalProperties[TxlemetryExceptionStepFields.stepsKey] = steps
+        }
+
+        // Sanitize is now called in buildEvent
+        let txlemetryEvent = buildEvent(
+            event: event,
+            distinctId: eventDistinctId,
+            properties: finalProperties,
+            timestamp: eventTimestamp
+        )
+
+        guard let txlemetryEvent else {
+            return
+        }
+
+        // Reevaluate if this is a snapshot event because the event might have been updated by the beforeSend hook
+        isSnapshotEvent = txlemetryEvent.event == "$snapshot"
+
+        // if this is a $snapshot event and $session_id is missing, don't process then event
+        if isSnapshotEvent, txlemetryEvent.properties["$session_id"] == nil {
+            return
+        }
+
+        // Automatically set person properties for feature flags during capture event
+        if !skipBuildProperties {
+            setPersonPropertiesForFlagsIfNeeded(userProperties, userPropertiesSetOnce: userPropertiesSetOnce)
+        }
+
+        // Session Replay has its own queue
+        if isSnapshotEvent {
+            replayQueue?.add(txlemetryEvent)
+            onEventCaptured.invoke(txlemetryEvent)
+        } else {
+            queueEvent(txlemetryEvent, queue: queue, deduplicatePersonProperties: deduplicatePersonProperties)
+        }
+    }
+
+    /// Records a screen view by capturing a `$screen` event.
+    ///
+    /// - Parameter screenTitle: The screen name to record.
+    @objc public func screen(_ screenTitle: String) {
+        screen(screenTitle, properties: nil)
+    }
+
+    /// Records a screen view by capturing a `$screen` event with `screenTitle`.
+    ///
+    /// The title is also cached and automatically attached as `$screen_name` to
+    /// every subsequent event (until `reset()` or `close()` clears it).
+    ///
+    /// To override the auto-attached value on a specific event, pass `$screen_name`
+    /// in that event's `properties` dictionary.
+    ///
+    /// - Parameters:
+    ///   - screenTitle: The screen name to record.
+    ///   - properties: Additional properties to attach to this `$screen` event.
+    @objc(screenWithTitle:properties:)
+    public func screen(_ screenTitle: String, properties: [String: Any]? = nil) {
+        if !isEnabled() {
+            return
+        }
+
+        if isOptOutState() {
+            return
+        }
+
+        // Strip SwiftUI wrappers (UIHostingController<X> → X). Drops degenerate
+        // inputs (empty, stripped-AnyView) — for those we skip the $screen event
+        // and leave the cache untouched so the last useful name survives.
+        guard let cleaned = TxlemetryScreenNameSanitizer.sanitize(rawScreenName: screenTitle) else {
+            return
+        }
+
+        // Cache the name before the queue check so a screen() call during init
+        // (queue not yet assigned) still seeds the cache for subsequent events.
+        // Track whether the value actually changed so we can skip the crash-
+        // replay snapshot refresh on duplicate viewDidAppears for the same VC.
+        let screenNameChanged = lastScreenLock.withLock { () -> Bool in
+            let changed = _lastScreenName != cleaned
+            _lastScreenName = cleaned
+            return changed
+        }
+
+        guard let queue else {
+            return
+        }
+
+        let props = [
+            "$screen_name": cleaned,
+        ].merging(sanitizeDictionary(properties) ?? [:]) { _, new in new }
+
+        let distinctId = getDistinctId()
+
+        let properties = buildProperties(distinctId: distinctId, properties: props)
+
+        guard let event = buildEvent(event: "$screen", distinctId: distinctId, properties: properties) else {
+            return
+        }
+
+        queueEvent(event, queue: queue)
+
+        // Fanout to subscribers (sanitized; downstream listeners no longer
+        // need to re-apply sanitize). Currently no in-tree subscribers — kept
+        // as an extension point for external consumers. Subscribers must not
+        // re-enter screen().
+        DI.main.screenViewPublisher.onNewScreenName(cleaned)
+
+        // Refresh the crash-replay snapshot only when the screen actually
+        // changed — `viewDidAppear` re-fires for the same VC on every tab
+        // switch / sheet dismiss, and the snapshot includes a full event-
+        // properties build + JSON serialize + customData write that we don't
+        // want to repeat on the main thread for no behavior change.
+        if screenNameChanged {
+            notifyContextDidChange()
+        }
+    }
+
+    func autocapture(
+        eventType: String,
+        elementsChain: String,
+        properties: [String: Any]
+    ) {
+        captureAutocaptureEvent(
+            "$autocapture",
+            eventType: eventType,
+            elementsChain: elementsChain,
+            properties: properties
+        )
+    }
+
+    func rageclick(
+        eventType: String,
+        elementsChain: String,
+        properties: [String: Any]
+    ) {
+        captureAutocaptureEvent(
+            "$rageclick",
+            eventType: eventType,
+            elementsChain: elementsChain,
+            properties: properties
+        )
+    }
+
+    private func captureAutocaptureEvent(
+        _ eventName: String,
+        eventType: String,
+        elementsChain: String,
+        properties: [String: Any]
+    ) {
+        if !isEnabled() {
+            return
+        }
+
+        if isOptOutState() {
+            return
+        }
+
+        guard let queue else {
+            return
+        }
+
+        let props = [
+            "$event_type": eventType,
+            "$elements_chain": elementsChain,
+        ].merging(sanitizeDictionary(properties) ?? [:]) { prop, _ in prop }
+
+        let distinctId = getDistinctId()
+
+        let properties = buildProperties(distinctId: distinctId, properties: props)
+
+        guard let event = buildEvent(event: eventName, distinctId: distinctId, properties: properties) else {
+            return
+        }
+
+        queueEvent(event, queue: queue)
+    }
+
+    private func sanitizeProperties(_ properties: [String: Any]) -> [String: Any] {
+        if let sanitizer = config.legacyPropertiesSanitizer {
+            return sanitizer.sanitize(properties)
+        }
+        return properties
+    }
+
+    /// Assigns an additional distinct ID to the current user.
+    ///
+    /// Use alias when a user should be connected to another identifier that was previously used
+    /// to track them. This sends a `$create_alias` event.
+    ///
+    /// - Parameter alias: The additional distinct ID to associate with the current user.
+    @objc public func alias(_ alias: String) {
+        if !isEnabled() {
+            return
+        }
+
+        if isOptOutState() {
+            return
+        }
+
+        if !requirePersonProcessing() {
+            return
+        }
+
+        guard let queue else {
+            return
+        }
+
+        let props = ["alias": alias]
+
+        let distinctId = getDistinctId()
+
+        let properties = buildProperties(distinctId: distinctId, properties: props)
+
+        guard let event = buildEvent(event: "$create_alias", distinctId: distinctId, properties: properties) else {
+            return
+        }
+
+        queueEvent(event, queue: queue)
+    }
+
+    private func groups(_ newGroups: [String: String]) -> [String: String] {
+        guard let storage else {
+            return [:]
+        }
+
+        var groups: [String: String]?
+        var mergedGroups: [String: String]?
+        groupsLock.withLock {
+            groups = getGroups()
+            mergedGroups = groups?.merging(newGroups) { _, new in new }
+
+            storage.setDictionary(forKey: .groups, contents: mergedGroups ?? [:])
+        }
+
+        var shouldReloadFlags = false
+
+        for (key, value) in newGroups where groups?[key] != value {
+            shouldReloadFlags = true
+            break
+        }
+
+        if shouldReloadFlags {
+            remoteConfig?.reloadFeatureFlags()
+        }
+
+        return mergedGroups ?? [:]
+    }
+
+    private func groupIdentify(type: String, key: String, groupProperties: [String: Any]? = nil) {
+        if !isEnabled() {
+            return
+        }
+
+        if isOptOutState() {
+            return
+        }
+
+        guard let queue else {
+            return
+        }
+
+        var props: [String: Any] = ["$group_type": type,
+                                    "$group_key": key]
+
+        let groupProps = sanitizeDictionary(groupProperties)
+
+        if groupProps != nil {
+            props["$group_set"] = groupProps
+        }
+
+        // Automatically set group properties for feature flags
+        setGroupPropertiesForFlagsIfNeeded(type: type, groupProperties: groupProperties)
+
+        // Same as .group but without associating the current user with the group
+        let distinctId = getDistinctId()
+
+        let properties = buildProperties(distinctId: distinctId, properties: props)
+
+        guard let event = buildEvent(event: "$groupidentify", distinctId: distinctId, properties: properties) else {
+            return
+        }
+
+        queueEvent(event, queue: queue)
+    }
+
+    func buildEvent(event eventName: String, distinctId: String, properties: [String: Any], timestamp: Date = Date()) -> TxlemetryEvent? {
+        let sanitizedProperties = sanitizeProperties(properties)
+
+        let event = TxlemetryEvent(
+            event: eventName,
+            distinctId: distinctId,
+            properties: sanitizedProperties,
+            timestamp: timestamp
+        )
+
+        let resultEvent = config.runBeforeSend(event)
+
+        if resultEvent == nil {
+            let originalMessage = "Txlemetry event \(eventName) was dropped"
+            let message = TxlemetryKnownUnsafeEditableEvent.contains(eventName)
+                ? "\(originalMessage). This can cause unexpected behavior."
+                : originalMessage
+
+            hedgeLog(message)
+        }
+
+        return resultEvent
+    }
+
+    private func queueEvent(_ event: TxlemetryEvent, queue: TxlemetryQueue<TxlemetryEvent>, deduplicatePersonProperties: Bool = false) {
+        let userProperties = event.properties["$set"] as? [String: Any]
+        let userPropertiesSetOnce = event.properties["$set_once"] as? [String: Any]
+        // Presence, not content: sanitizing can empty a non-empty input (a `UUID` or `Data` value
+        // is dropped), and that empty `$set` is still queued, so it needs a marker too.
+        if event.event == TxlemetryKnownUnsafeEditableEvent.set.rawValue || event.event == TxlemetryKnownUnsafeEditableEvent.identify.rawValue,
+           userProperties != nil || userPropertiesSetOnce != nil,
+           let storageManager = config.storageManager
+        {
+            let hash = getPersonPropertiesHash(
+                distinctId: event.distinctId,
+                userPropertiesToSet: userProperties,
+                userPropertiesToSetOnce: userPropertiesSetOnce
+            )
+            // Check and enqueue under the same lock so concurrent calls cannot enqueue duplicates.
+            let isDuplicate = cachedPersonPropertiesLock.withLock {
+                if deduplicatePersonProperties, storageManager.getPersonPropertiesHash() == hash {
+                    return true
+                }
+                // Only a stored event marks the properties as sent, so a failed write is retried.
+                if queue.add(event) {
+                    storageManager.setPersonPropertiesHash(hash)
+                }
+                return false
+            }
+            // Only a suppressed duplicate skips the callback below: subscribers such as replay
+            // triggers and event-activated surveys don't depend on this queue reaching disk.
+            guard !isDuplicate else { return }
+        } else {
+            queue.add(event)
+        }
+        onEventCaptured.invoke(event)
+    }
+
+    /// Associates subsequent events with a group.
+    ///
+    /// - Parameters:
+    ///   - type: Group type, such as `"company"` or `"organization"`.
+    ///   - key: Group key from your application.
+    @objc(groupWithType:key:)
+    public func group(type: String, key: String) {
+        group(type: type, key: key, groupProperties: nil)
+    }
+
+    /// Associates subsequent events with a group and optionally updates group properties.
+    ///
+    /// This sends a `$groupidentify` event and reloads feature flags if the group value changed.
+    ///
+    /// - Parameters:
+    ///   - type: Group type, such as `"company"` or `"organization"`.
+    ///   - key: Group key from your application.
+    ///   - groupProperties: Optional properties to set on the group profile.
+    @objc(groupWithType:key:groupProperties:)
+    public func group(type: String, key: String, groupProperties: [String: Any]? = nil) {
+        if !isEnabled() {
+            return
+        }
+
+        if isOptOutState() {
+            return
+        }
+
+        if !requirePersonProcessing() {
+            return
+        }
+
+        _ = groups([type: key])
+
+        groupIdentify(type: type, key: key, groupProperties: sanitizeDictionary(groupProperties))
+
+        // Notify integrations of context change (e.g., for crash reporting)
+        notifyContextDidChange()
+    }
+
+    // FEATURE FLAGS
+
+    /// Sets person properties that will be included in feature flag evaluation requests.
+    ///
+    /// This method allows you to override server-side person properties for immediate feature flag evaluation,
+    /// solving the race condition where person properties from `identify()` calls may not have been processed
+    /// by the server yet.
+    ///
+    /// Properties are merged additively with existing properties. Feature flags are automatically reloaded
+    /// after setting properties.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Set properties and automatically reload flags
+    /// TxlemetrySDK.shared.setPersonPropertiesForFlags([
+    ///     "$app_version": "2.93.0",
+    ///     "plan": "premium"
+    /// ])
+    ///
+    /// // Now feature flags will be evaluated with these properties
+    /// let flagValue = TxlemetrySDK.shared.isFeatureEnabled("new_feature")
+    /// ```
+    ///
+    /// - Important: The reload is asynchronous and is **not** ordered against the automatic preload
+    ///   that `TxlemetryConfig.preloadFeatureFlags` starts at setup. See
+    ///   ``setPersonPropertiesForFlags(_:reloadFeatureFlags:)`` for the startup ordering contract and
+    ///   how to wait for flags evaluated with these properties.
+    ///
+    /// - Parameter properties: Dictionary of person properties to include in flag evaluation
+    /// - SeeAlso: `setPersonPropertiesForFlags(_:reloadFeatureFlags:)` to control flag reloading behavior
+    @objc public func setPersonPropertiesForFlags(_ properties: [String: Any]) {
+        setPersonPropertiesForFlags(properties, reloadFeatureFlags: true)
+    }
+
+    /// Sets person properties that will be included in feature flag evaluation requests.
+    ///
+    /// This method allows you to override server-side person properties for immediate feature flag evaluation,
+    /// solving the race condition where person properties from `identify()` calls may not have been processed
+    /// by the server yet.
+    ///
+    /// Properties are merged additively with existing properties.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Set properties without automatically reloading flags
+    /// TxlemetrySDK.shared.setPersonPropertiesForFlags([
+    ///     "$app_version": "2.93.0",
+    ///     "plan": "premium"
+    /// ], reloadFeatureFlags: false)
+    ///
+    /// // Manually reload flags later
+    /// TxlemetrySDK.shared.reloadFeatureFlags()
+    /// ```
+    ///
+    /// ## Startup ordering
+    /// Several code paths can each start a `/flags` request at launch, and none of them is ordered
+    /// against this call:
+    /// - the automatic preload started during `setup()` when `TxlemetryConfig.preloadFeatureFlags` is
+    ///   `true` (the default) — it can go out before your properties are set, so an early flag read
+    ///   may see values evaluated without them,
+    /// - `identify(...)`, which reloads flags itself,
+    /// - any explicit `reloadFeatureFlags()` your app makes.
+    ///
+    /// Requests are coalesced rather than run concurrently, so your properties always reach the server
+    /// eventually. To read a flag that reflects them, set them without reloading and wait for an
+    /// explicit reload rather than reading immediately after setup:
+    ///
+    /// ```swift
+    /// TxlemetrySDK.shared.setPersonPropertiesForFlags(["plan": "premium"], reloadFeatureFlags: false)
+    /// TxlemetrySDK.shared.reloadFeatureFlags {
+    ///     let flagValue = TxlemetrySDK.shared.isFeatureEnabled("new_feature")
+    /// }
+    /// ```
+    ///
+    /// Setting `TxlemetryConfig.preloadFeatureFlags = false` removes the automatic preload entirely and
+    /// leaves your app in control of when flags load.
+    ///
+    /// - Note: `reset()` clears person properties set here, so they must be set again afterwards.
+    /// - Note: `reloadFeatureFlags(_:)` reports that the reload finished, not that it succeeded. If the
+    ///   request fails, or the project is over its feature flag quota, the handler still runs and the
+    ///   flags you read are the previously cached ones.
+    ///
+    /// - Parameters:
+    ///   - properties: Dictionary of person properties to include in flag evaluation
+    ///   - reloadFeatureFlags: Whether to automatically reload feature flags after setting properties
+    @objc(setPersonPropertiesForFlagsWithProperties:reloadFeatureFlags:)
+    public func setPersonPropertiesForFlags(_ properties: [String: Any], reloadFeatureFlags: Bool = true) {
+        if !isEnabled() {
+            return
+        }
+
+        let sanitizedProperties = sanitizeDictionary(properties) ?? [:]
+        guard !sanitizedProperties.isEmpty else { return }
+        remoteConfig?.setPersonPropertiesForFlags(sanitizedProperties)
+
+        if reloadFeatureFlags {
+            remoteConfig?.reloadFeatureFlags()
+        }
+    }
+
+    /// Resets all person properties that were set for feature flag evaluation.
+    ///
+    /// After calling this method, feature flag evaluation will only use server-side person properties
+    /// and will not include any locally overridden properties.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Clear all locally set person properties for flags
+    /// TxlemetrySDK.shared.resetPersonPropertiesForFlags()
+    ///
+    /// // Feature flags will now use only server-side properties
+    /// let flagValue = TxlemetrySDK.shared.isFeatureEnabled("feature")
+    /// ```
+    @objc public func resetPersonPropertiesForFlags() {
+        resetPersonPropertiesForFlags(reloadFeatureFlags: true)
+    }
+
+    /// Resets all person properties that were set for feature flag evaluation.
+    ///
+    /// After calling this method, feature flag evaluation will only use server-side person properties
+    /// and will not include any locally overridden properties.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Clear all locally set person properties for flags
+    /// TxlemetrySDK.shared.resetPersonPropertiesForFlags(reloadFeatureFlags: true)
+    ///
+    /// // Feature flags will now use only server-side properties
+    /// let flagValue = TxlemetrySDK.shared.isFeatureEnabled("feature")
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - reloadFeatureFlags: Whether to automatically reload feature flags after resetting properties
+    @objc(resetPersonPropertiesForFlagsWithReloadFeatureFlags:)
+    public func resetPersonPropertiesForFlags(reloadFeatureFlags: Bool = true) {
+        if !isEnabled() {
+            return
+        }
+
+        remoteConfig?.resetPersonPropertiesForFlags()
+
+        if reloadFeatureFlags {
+            remoteConfig?.reloadFeatureFlags()
+        }
+    }
+
+    /// Sets properties for a specific group type to include when evaluating feature flags.
+    /// These properties supplement the standard group information sent to Txlemetry for flag evaluation,
+    /// providing additional context that can be used in flag targeting conditions.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// TxlemetrySDK.shared.setGroupPropertiesForFlags("organization", properties: [
+    ///     "plan": "enterprise",
+    ///     "seats": 50,
+    ///     "industry": "technology"
+    /// ])
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - groupType: The group type identifier (e.g., "organization", "team")
+    ///   - properties: Dictionary of properties to set for this group type
+    /// - Note: This method automatically reloads feature flags to apply the new properties.
+    /// - SeeAlso: `setGroupPropertiesForFlags(_:properties:reloadFeatureFlags:)` to control flag reloading behavior
+    @objc(setGroupPropertiesForFlags:properties:)
+    public func setGroupPropertiesForFlags(_ groupType: String, properties: [String: Any]) {
+        setGroupPropertiesForFlags(groupType, properties: properties, reloadFeatureFlags: true)
+    }
+
+    /// Sets properties for a specific group type to include when evaluating feature flags.
+    /// These properties supplement the standard group information sent to Txlemetry for flag evaluation,
+    /// providing additional context that can be used in flag targeting conditions.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Set properties without automatically reloading flags
+    /// TxlemetrySDK.shared.setGroupPropertiesForFlags("organization", properties: [
+    ///     "plan": "enterprise",
+    ///     "seats": 50
+    /// ], reloadFeatureFlags: false)
+    ///
+    /// // Manually reload flags later
+    /// TxlemetrySDK.shared.reloadFeatureFlags()
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - groupType: The group type identifier (e.g., "organization", "team")
+    ///   - properties: Dictionary of properties to set for this group type
+    ///   - reloadFeatureFlags: Whether to automatically reload feature flags after setting properties
+    @objc(setGroupPropertiesForFlags:properties:reloadFeatureFlags:)
+    public func setGroupPropertiesForFlags(_ groupType: String, properties: [String: Any], reloadFeatureFlags: Bool = true) {
+        if !isEnabled() {
+            return
+        }
+
+        let sanitizedProperties = sanitizeDictionary(properties) ?? [:]
+        guard !sanitizedProperties.isEmpty else { return }
+        remoteConfig?.setGroupPropertiesForFlags(groupType, properties: sanitizedProperties)
+
+        if reloadFeatureFlags {
+            remoteConfig?.reloadFeatureFlags()
+        }
+    }
+
+    /// Clears all group properties for feature flag evaluation.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Clear all group properties
+    /// TxlemetrySDK.shared.resetGroupPropertiesForFlags()
+    /// ```
+    @objc public func resetGroupPropertiesForFlags() {
+        internalResetGroupPropertiesForFlags(groupType: nil, reloadFeatureFlags: true)
+    }
+
+    /// Clears all group properties for feature flag evaluation.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Clear all group properties
+    /// TxlemetrySDK.shared.resetGroupPropertiesForFlags(reloadFeatureFlags: true)
+    /// ```
+    ///
+    /// - Parameter reloadFeatureFlags: Whether to automatically reload feature flags after clearing all group properties.
+    @objc(resetGroupPropertiesForFlagsWithReloadFeatureFlags:)
+    public func resetGroupPropertiesForFlags(reloadFeatureFlags: Bool = true) {
+        internalResetGroupPropertiesForFlags(groupType: nil, reloadFeatureFlags: reloadFeatureFlags)
+    }
+
+    /// Clears group properties for feature flag evaluation for a specific group type.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Clear properties for specific group type
+    /// TxlemetrySDK.shared.resetGroupPropertiesForFlags("organization")
+    /// ```
+    ///
+    /// - Parameter groupType: The group type to clear properties for
+    @objc(resetGroupPropertiesForFlagsWithGroupType:)
+    public func resetGroupPropertiesForFlags(_ groupType: String) {
+        internalResetGroupPropertiesForFlags(groupType: groupType, reloadFeatureFlags: true)
+    }
+
+    /// Clears group properties for feature flag evaluation for a specific group type.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Clear properties for specific group type
+    /// TxlemetrySDK.shared.resetGroupPropertiesForFlags("organization", reloadFeatureFlags: true)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - groupType: The group type to clear properties for
+    ///   - reloadFeatureFlags: Whether to automatically reload feature flags after clearing properties for this group type.
+    @objc(resetGroupPropertiesForFlagsWithGroupType:reloadFeatureFlags:)
+    public func resetGroupPropertiesForFlags(_ groupType: String, reloadFeatureFlags: Bool = true) {
+        internalResetGroupPropertiesForFlags(groupType: groupType, reloadFeatureFlags: reloadFeatureFlags)
+    }
+
+    /// Internal implementation for resetting group properties.
+    private func internalResetGroupPropertiesForFlags(groupType: String?, reloadFeatureFlags: Bool) {
+        if !isEnabled() {
+            return
+        }
+
+        remoteConfig?.resetGroupPropertiesForFlags(groupType)
+
+        if reloadFeatureFlags {
+            remoteConfig?.reloadFeatureFlags()
+        }
+    }
+
+    /// Reloads feature flags for the current user and group context.
+    @objc public func reloadFeatureFlags() {
+        reloadFeatureFlags {
+            // No use case
+        }
+    }
+
+    /// Reloads feature flags and invokes a callback when finished.
+    ///
+    /// - Parameter callback: Invoked when the reload finishes, or immediately if the reload
+    ///   is skipped (SDK disabled/opted-out, or no remote config available).
+    @objc(reloadFeatureFlagsWithCallback:)
+    public func reloadFeatureFlags(_ callback: @escaping () -> Void) {
+        if !isEnabled() {
+            callback()
+            return
+        }
+
+        guard let remoteConfig else {
+            callback()
+            return
+        }
+
+        remoteConfig.reloadFeatureFlags { _ in
+            callback()
+        }
+    }
+
+    /// Captures a `$feature_view` event for the specified feature flag.
+    ///
+    /// - Parameters:
+    ///   - flag: The key of the feature flag being viewed.
+    ///   - flagVariant: The variant of the feature flag being viewed. If `nil`, the SDK
+    ///     looks up the current flag value and skips capture when no value is available.
+    @objc public func captureFeatureView(flag: String, flagVariant: String?) {
+        captureFeatureEvent(
+            "$feature_view",
+            flag: flag,
+            flagVariant: flagVariant,
+            logName: "captureFeatureView"
+        )
+    }
+
+    /// Captures a `$feature_interaction` event for the specified feature flag.
+    ///
+    /// - Parameters:
+    ///   - flag: The key of the feature flag being interacted with.
+    ///   - flagVariant: The variant of the feature flag being interacted with. If `nil`, the SDK
+    ///     looks up the current flag value and skips capture when no value is available.
+    @objc public func captureFeatureInteraction(
+        flag: String,
+        flagVariant: String?
+    ) {
+        captureFeatureEvent(
+            "$feature_interaction",
+            flag: flag,
+            flagVariant: flagVariant,
+            logName: "captureFeatureInteraction"
+        )
+    }
+
+    private func captureFeatureEvent(
+        _ event: String,
+        flag: String,
+        flagVariant: String?,
+        logName: String
+    ) {
+        if !isEnabled() {
+            return
+        }
+
+        if isOptOutState() {
+            return
+        }
+
+        // Get the variant value — prefer the explicitly passed variant, then fall back to a flag lookup.
+        // If neither is available, there is no meaningful variant to record, so we skip the event.
+        guard let variant: Any = flagVariant ?? getFeatureFlag(flag, sendEvent: false) else {
+            hedgeLog("\(logName) called for flag '\(flag)' but no variant value is available. Event will not be captured.")
+            return
+        }
+
+        var props: [String: Any] = [
+            "feature_flag": flag,
+        ]
+
+        if let variantStr = variant as? String {
+            props["feature_flag_variant"] = variantStr
+        }
+
+        let userProps: [String: Any] = [
+            "\(event)/\(flag)": variant,
+        ]
+
+        capture(
+            event,
+            properties: props,
+            userProperties: userProps
+        )
+    }
+
+    /// Returns the feature flag result containing the flag value, variant, and payload.
+    ///
+    /// This is the recommended method for retrieving feature flags as it provides
+    /// all flag information in a single call and properly tracks flag usage.
+    ///
+    /// - Parameter key: The feature flag key
+    /// - Returns: A `TxlemetryFeatureFlagResult` containing the flag's enabled state,
+    ///   variant (if any), and payload (if any), or `nil` if the flag doesn't exist.
+    @objc public func getFeatureFlagResult(_ key: String) -> TxlemetryFeatureFlagResult? {
+        getFeatureFlagResult(key, sendEvent: nil)
+    }
+
+    /// Returns the feature flag result and optionally captures a usage event.
+    ///
+    /// - Parameters:
+    ///   - key: The feature flag key.
+    ///   - sendFeatureFlagEvent: Whether to capture `$feature_flag_called` for this lookup.
+    /// - Returns: A result containing enabled state, variant, and payload, or `nil` if unavailable.
+    @objc(getFeatureFlagResultWithKey:sendFeatureFlagEvent:)
+    public func getFeatureFlagResult(_ key: String, sendFeatureFlagEvent: Bool) -> TxlemetryFeatureFlagResult? {
+        getFeatureFlagResult(key, sendEvent: sendFeatureFlagEvent)
+    }
+
+    private func getFeatureFlagResult(_ key: String, sendEvent sendFeatureFlagEvent: Bool? = nil) -> TxlemetryFeatureFlagResult? {
+        if !isEnabled() {
+            return nil
+        }
+
+        guard let remoteConfig else {
+            return nil
+        }
+
+        let result = remoteConfig.getFeatureFlagResult(key)
+
+        let shouldSendEvent = sendFeatureFlagEvent ?? config.sendFeatureFlagEvent
+        if shouldSendEvent {
+            let flagValue: Any? = result?.variant ?? result?.enabled
+            reportFeatureFlagCalled(flagKey: key, flagValue: flagValue)
+        }
+
+        return result
+    }
+
+    /// Returns a feature flag value.
+    ///
+    /// Boolean flags return `Bool`. Multivariate flags return their variant `String`.
+    ///
+    /// - Parameter key: The feature flag key.
+    /// - Returns: `Bool`, `String`, or `nil` if the flag is unavailable.
+    @objc public func getFeatureFlag(_ key: String) -> Any? {
+        getFeatureFlag(key, sendEvent: nil)
+    }
+
+    /// Returns a feature flag value and optionally captures a usage event.
+    ///
+    /// - Parameters:
+    ///   - key: The feature flag key.
+    ///   - sendFeatureFlagEvent: Whether to capture `$feature_flag_called` for this lookup.
+    /// - Returns: `Bool`, `String`, or `nil` if the flag is unavailable.
+    @objc(getFeatureFlagWithKey:sendFeatureFlagEvent:)
+    public func getFeatureFlag(_ key: String, sendFeatureFlagEvent: Bool) -> Any? {
+        getFeatureFlag(key, sendEvent: sendFeatureFlagEvent)
+    }
+
+    private func getFeatureFlag(_ key: String, sendEvent sendFeatureFlagEvent: Bool? = nil) -> Any? {
+        let result = getFeatureFlagResult(key, sendEvent: sendFeatureFlagEvent)
+        return result?.variant ?? result?.enabled
+    }
+
+    /// Returns whether a feature flag is enabled.
+    ///
+    /// Multivariate flags are considered enabled when a variant string is returned.
+    ///
+    /// - Parameter key: The feature flag key.
+    /// - Returns: `true` when the flag is enabled, otherwise `false`.
+    @objc public func isFeatureEnabled(_ key: String) -> Bool {
+        isFeatureEnabled(key, sendEvent: nil)
+    }
+
+    /// Returns whether a feature flag is enabled and optionally captures a usage event.
+    ///
+    /// - Parameters:
+    ///   - key: The feature flag key.
+    ///   - sendFeatureFlagEvent: Whether to capture `$feature_flag_called` for this lookup.
+    /// - Returns: `true` when the flag is enabled, otherwise `false`.
+    @objc(isFeatureEnabledWithKey:sendFeatureFlagEvent:)
+    public func isFeatureEnabled(_ key: String, sendFeatureFlagEvent: Bool) -> Bool {
+        isFeatureEnabled(key, sendEvent: sendFeatureFlagEvent)
+    }
+
+    private func isFeatureEnabled(_ key: String, sendEvent: Bool? = nil) -> Bool {
+        let result = getFeatureFlag(key, sendEvent: sendEvent)
+        return result is String ? true : (result as? Bool) ?? false
+    }
+
+    /// Returns all currently loaded feature flags as structured results.
+    ///
+    /// Each `TxlemetryFeatureFlagResult` carries the flag's `key`, `enabled` state,
+    /// `variant` (for multivariate flags), and decoded `payload`. Flags become available
+    /// after they finish loading from the server; before the first load (or when the SDK
+    /// is disabled) this returns `nil`. Reading does not capture `$feature_flag_called` events.
+    ///
+    /// - Returns: An array of `TxlemetryFeatureFlagResult`, or `nil` if no flags are loaded.
+    ///
+    /// ```swift
+    /// for flag in TxlemetrySDK.shared.getAllFeatureFlags() ?? [] {
+    ///     print(flag.key, flag.enabled, flag.payload as Any)
+    /// }
+    /// ```
+    @objc public func getAllFeatureFlags() -> [TxlemetryFeatureFlagResult]? {
+        if !isEnabled() {
+            return nil
+        }
+        return remoteConfig?.getAllFeatureFlagResults()
+    }
+
+    /// Returns the payload for a feature flag.
+    ///
+    /// - Parameter key: The feature flag key.
+    /// - Returns: The flag payload, or `nil` if the flag or payload is unavailable.
+    /// - Warning: This method does not send the `$feature_flag_called` event.
+    ///   Use `getFeatureFlagResult(_:)` instead for proper analytics tracking.
+    @available(*, deprecated, message: "Use getFeatureFlagResult(_:) instead which properly tracks feature flag usage")
+    @objc public func getFeatureFlagPayload(_ key: String) -> Any? {
+        // Don't send event to maintain backwards compatibility
+        let result = getFeatureFlagResult(key, sendEvent: false)
+        return result?.payload
+    }
+
+    private func flagValuesEqual(_ lhs: Any?, _ rhs: Any?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (boolValue as Bool, flagBoolValue as Bool):
+            return boolValue == flagBoolValue
+        case let (stringValue as String, flagStringValue as String):
+            return stringValue == flagStringValue
+        default:
+            return false
+        }
+    }
+
+    /// The strict property allowlist for minimal `$feature_flag_called` events. Everything else —
+    /// registered super properties, `$active_feature_flags`, the `$feature/<key>` enumeration,
+    /// bootstrap enrichment — is stripped. Kept in sync with the cross-SDK minimal
+    /// `$feature_flag_called` contract.
+    private static let minimalFeatureFlagCalledProperties: Set<String> = [
+        "$feature_flag",
+        "$feature_flag_response",
+        "$feature_flag_has_experiment",
+        "$feature_flag_id",
+        "$feature_flag_version",
+        "$feature_flag_reason",
+        "$feature_flag_request_id",
+        "$feature_flag_evaluated_at",
+        "$groups",
+        "$process_person_profile",
+        "$session_id",
+        "$lib",
+        "$lib_version",
+        // Mobile's debug/breakdown analog to python's $os/$os_version/$python_runtime and browser
+        // JS's $current_url/$pathname: kept so OS- and app-version-segmented insights still work.
+        "$os_name",
+        "$os_version",
+        "$app_version",
+        // Forward-looking cross-SDK contract entries: not produced by buildProperties for
+        // $feature_flag_called on iOS today ($device_id is added later by TxlemetryApi on the
+        // /flags request only; $window_id is snapshot-only; $feature_flag_error isn't emitted
+        // by this SDK yet). Kept so the allowlist matches the shared contract as those signals land.
+        "$feature_flag_error",
+        "$window_id",
+        "$device_id",
+    ]
+
+    private func reportFeatureFlagCalled(flagKey: String, flagValue: Any?) {
+        if remoteConfig == nil {
+            return
+        }
+        var shouldCapture = true
+
+        flagCallReportedLock.withLock {
+            var values = flagCallReported[flagKey] ?? []
+
+            for value in values {
+                if flagValuesEqual(value, flagValue) {
+                    shouldCapture = false
+                    break
+                }
+            }
+
+            if shouldCapture {
+                values.append(flagValue)
+                flagCallReported[flagKey] = values
+            }
+        }
+
+        if shouldCapture {
+            let requestId = remoteConfig?.lastRequestId ?? ""
+            let evaluatedAt = remoteConfig?.lastEvaluatedAt
+            let details = remoteConfig?.getFeatureFlagDetails(flagKey)
+            // Unknown until the flags response explicitly reports it; any missing signal → full event.
+            var hasExperiment: Bool?
+
+            var properties: [String: Any] = [
+                "$feature_flag": flagKey,
+                "$feature_flag_response": flagValue ?? NSNull(),
+                "$feature_flag_request_id": requestId,
+            ]
+
+            if let evaluatedAt {
+                properties["$feature_flag_evaluated_at"] = evaluatedAt
+            }
+
+            if let details = details as? [String: Any] {
+                if let reason = details["reason"] as? [String: Any] {
+                    properties["$feature_flag_reason"] = reason["description"] ?? NSNull()
+                }
+
+                if let metadata = details["metadata"] as? [String: Any] {
+                    properties["$feature_flag_id"] = metadata["id"] ?? NSNull()
+                    properties["$feature_flag_version"] = metadata["version"] ?? NSNull()
+                    if let flagHasExperiment = metadata["has_experiment"] as? Bool {
+                        properties["$feature_flag_has_experiment"] = flagHasExperiment
+                        hasExperiment = flagHasExperiment
+                    }
+                }
+            }
+
+            if let bootstrapMetadata = remoteConfig?.getBootstrapCallMetadata(flagKey) {
+                properties["$feature_flag_bootstrapped_response"] = bootstrapMetadata.response
+
+                if let bootstrappedPayload = bootstrapMetadata.payload {
+                    properties["$feature_flag_bootstrapped_payload"] = bootstrappedPayload
+                }
+
+                properties["$used_bootstrap_value"] = bootstrapMetadata.usedBootstrapValue
+            }
+
+            // Emit the minimal shape only when the server gate is on and the flag verifiably has no
+            // experiment. Experiment-linked flags keep the full envelope for exposure analysis.
+            let sendMinimalEvent = remoteConfig?.sendMinimalFlagCalledEvents == true && hasExperiment == false
+
+            captureInternal(
+                "$feature_flag_called",
+                properties: properties,
+                propertyAllowlist: sendMinimalEvent ? TxlemetrySDK.minimalFeatureFlagCalledProperties : nil
+            )
+        }
+    }
+
+    private func isEnabled() -> Bool {
+        let enabled = setupLock.withLock { self.enabled }
+        if !enabled {
+            hedgeLog("Txlemetry method was called without `setup` being complete. Call wil be ignored.")
+        }
+        return enabled
+    }
+
+    /// Opts the current user back into data capture.
+    ///
+    /// This persists the opt-in state, unless opt-out persistence is disabled, and installs
+    /// integrations that were disabled while opted out.
+    @objc public func optIn() {
+        if !isEnabled() {
+            return
+        }
+
+        if !isOptOut() {
+            return
+        }
+
+        // Read `config` before taking optOutLock: its getter takes setupLock, and setup() holds
+        // setupLock while taking optOutLock, so reading it inside would invert the two.
+        let config = self.config
+        optOutLock.withLock {
+            config.optOut = false
+            if config.persistOptOut {
+                storage?.setBool(forKey: .optOut, contents: false)
+            }
+        }
+
+        setupLock.withLock {
+            installIntegrations()
+            // Start the buffer for this run, then notify the freshly installed crash writer of the
+            // current context and any buffered steps (the buffer survives opt-out, so steps may exist).
+            createExceptionStepsBufferIfNeeded()
+            notifyContextDidChange()
+            notifyExceptionStepsDidChange()
+        }
+
+        pushSubscriptionHandler?.onOptIn()
+
+        #if os(iOS)
+            // A prior logout unregister cleared the push token; opt-in re-installs the subscription
+            // integration above but that alone doesn't refetch the token. Re-request it so the
+            // redelivered token re-registers this device, re-arming push without an app restart (#746).
+            // Gate on the same conditions that install the subscription integration: auto-capture and
+            // swizzling. Without swizzling the integration is skipped, so refetching would fire the host's
+            // APNs lifecycle with no observer to forward the token.
+            if #available(iOS 14.0, *), config.capturePushNotificationSubscriptions, config.enableSwizzling {
+                TxlemetryPushNotificationSubscriptionIntegration.requestTokenRefresh()
+            }
+        #endif
+    }
+
+    /// Opts the current user out of data capture.
+    ///
+    /// This persists the opt-out state, unless opt-out persistence is disabled, stops integrations,
+    /// and causes future capture calls to be ignored.
+    /// It also unregisters this device's push subscription, so Workflows stop sending it notifications.
+    /// The device token itself is kept, so `optIn()` resubscribes this device on its own — on the next
+    /// `flush()` or launch at the latest — with no further call from the app.
+    @objc public func optOut() {
+        if !isEnabled() {
+            return
+        }
+
+        if isOptOut() {
+            return
+        }
+
+        // Same lock-order reason as optIn(): hoist the setupLock-guarded read out of optOutLock.
+        let config = self.config
+        optOutLock.withLock {
+            config.optOut = true
+            if config.persistOptOut {
+                storage?.setBool(forKey: .optOut, contents: true)
+            }
+        }
+
+        pushSubscriptionHandler?.onOptOut()
+
+        setupLock.withLock {
+            uninstallIntegrations()
+        }
+    }
+
+    /// Returns whether this SDK instance is currently opted out.
+    ///
+    /// - Returns: `true` when opted out or when the SDK is not set up.
+    @objc public func isOptOut() -> Bool {
+        if !isEnabled() {
+            return true
+        }
+
+        return config.optOut
+    }
+
+    /// Shuts down this SDK instance and clears its in-memory state.
+    ///
+    /// Queues are stopped, integrations are uninstalled, and this instance must be set up again before reuse.
+    @objc public func close() {
+        if !isEnabled() {
+            return
+        }
+
+        setupLock.withLock {
+            enabled = false
+            TxlemetrySDK.projectTokens.remove(config.projectToken)
+
+            queue?.stop()
+            replayQueue?.stop()
+            logsQueue?.stop()
+
+            queue = nil
+            replayQueue = nil
+            logsQueue = nil
+            pushSubscriptionHandler = nil
+            // Closing ends the run: clear the buffer, which publishes empty steps so the integration
+            // drops them from customData. Nil the reference so later adds no-op. (reset()/identify keep it.)
+            let bufferToClear = exceptionStepsBuffer
+            exceptionStepsBuffer = nil
+            bufferToClear?.clear()
+            config.storageManager?.reset(keepAnonymousId: config.reuseAnonymousId)
+            config.storageManager = nil
+            remoteConfig = nil
+            storage = nil
+            #if !os(watchOS)
+                self.reachability?.stopNotifier()
+                reachability = nil
+            #endif
+            flagCallReportedLock.withLock {
+                flagCallReported.removeAll()
+            }
+            context = nil
+            sessionManager.endSession()
+            didEnterBackgroundToken = nil
+            logger = nil
+            toggleHedgeLog(false)
+
+            uninstallIntegrations()
+            config = TxlemetryConfig(projectToken: "")
+        }
+        // Outside setupLock to avoid lock-ordering coupling between
+        // setupLock and lastScreenLock.
+        lastScreenLock.withLock { _lastScreenName = nil }
+    }
+
+    #if os(iOS)
+        /**
+         Starts session recording.
+
+         This method will have no effect if Txlemetry is not enabled, or if session replay is disabled in your project settings.
+
+         Ingestion controls are not overridden when calling this method. The recording will not start if:
+         - The session is not sampled,
+         - Event triggers are configured and have not been activated for the current session.
+
+         ## Note:
+         - Calling this method will resume the current session or create a new one if it doesn't exist
+         */
+        @objc(startSessionRecording)
+        public func startSessionRecording() {
+            startSessionRecording(resumeCurrent: true)
+        }
+
+        /**
+         Starts session recording.
+
+         This method will have no effect if Txlemetry is not enabled, or if session replay is disabled in your project settings.
+
+         Ingestion controls are not overridden when calling this method. The recording will not start if:
+         - The session is not sampled,
+         - Event triggers are configured and have not been activated for the current session.
+
+         - Parameter resumeCurrent:
+            Whether to resume recording of current session (true) or start a new session (false).
+         */
+        @objc(startSessionRecordingWithResumeCurrent:)
+        public func startSessionRecording(resumeCurrent: Bool) {
+            if !isEnabled() {
+                return
+            }
+
+            if isOptOutState() {
+                return
+            }
+
+            if replayIntegration == nil {
+                // replay integration was not previously installed (probably disabled in config), attempt to install it
+                setupLock.withLock {
+                    installReplayIntegration()
+                }
+            }
+
+            guard let replayIntegration else {
+                return
+            }
+
+            if resumeCurrent, replayIntegration.isActive() {
+                // nothing to resume, already active
+                return
+            }
+
+            guard let remoteConfig, remoteConfig.isSessionReplayFlagActive() else {
+                return hedgeLog("Could not start recording. Session replay feature flag is disabled.")
+            }
+
+            guard (resumeCurrent
+                ? sessionManager.getSessionId()
+                : sessionManager.getNextSessionId()) != nil
+            else {
+                return hedgeLog("Could not start recording. Missing session id.")
+            }
+
+            replayIntegration.start()
+        }
+
+        /**
+         Stops the current session recording if one is in progress.
+
+         This method will have no effect if Txlemetry is not enabled
+         */
+        @objc public func stopSessionRecording() {
+            if !isEnabled() {
+                return
+            }
+
+            guard let replayIntegration, replayIntegration.isActive() else {
+                return
+            }
+
+            replayIntegration.stop()
+        }
+
+        /// Captures the current native window for a first-party wrapper SDK
+        /// (e.g. txlemetry-flutter) that drives session-replay capture on its own
+        /// cadence. Not for app use — it shares snapshot state with the normal
+        /// timer-driven capture. Returns true when an image is captured and enqueued
+        /// for asynchronous masking; returns false when capture cannot be enqueued.
+        ///
+        /// Flutter treats true as a started bridge episode. A rare allocation failure
+        /// during later masking can still drop that frame after Flutter sees success.
+        /// The frame is dropped safely, never sent unmasked. Keep masking off main and
+        /// this synchronous contract for now; revisit final-result reporting if the
+        /// missed opening frame becomes a practical problem.
+        ///
+        /// Pass [episodeFirstFrame] until the episode's first frame has been
+        /// enqueued (returned true) — not just on the first attempt: it
+        /// renders with `afterScreenUpdates` so a freshly-presented screen
+        /// isn't captured black, and re-arms the per-window meta and dedup
+        /// hash, so a retried opening frame keeps its reset. Drop it for
+        /// steady-state frames (it flickers secure fields).
+        ///
+        /// Prefer the main thread. An off-main call blocks on a synchronous
+        /// main-queue hop for the duration of the capture, so it must not come
+        /// from a queue the main thread can be waiting on.
+        ///
+        /// SPI, not public API: no stability guarantees.
+        @_spi(TxlemetryInternal) @discardableResult public func captureSessionReplaySnapshot(
+            episodeFirstFrame: Bool
+        ) -> Bool {
+            if !isEnabled() {
+                return false
+            }
+
+            return replayIntegration?.captureBridgeSnapshot(episodeFirstFrame: episodeFirstFrame) ?? false
+        }
+
+        /// The per-event replay debug map (`$recording_status`, `$sdk_debug_replay_*`) that first-party
+        /// wrappers merge into events they build themselves; empty when replay is not installed.
+        ///
+        /// SPI, not public API: no stability guarantees.
+        @_spi(TxlemetryInternal) public func sessionReplayDebugProperties() -> [String: Any] {
+            replayIntegration?.debugProperties() ?? [:]
+        }
+    #endif
+
+    /// Creates and sets up an additional SDK instance.
+    ///
+    /// - Parameter config: Configuration for the new instance.
+    /// - Returns: A configured `TxlemetrySDK` instance.
+    @objc public static func with(_ config: TxlemetryConfig) -> TxlemetrySDK {
+        let txlemetry = TxlemetrySDK(config)
+        txlemetry.setup(config)
+        return txlemetry
+    }
+
+    #if os(iOS)
+        /// Returns whether session replay is currently recording.
+        ///
+        /// - Returns: `true` only when replay is active, a session ID exists, and remote config allows recording.
+        @objc public func isSessionReplayActive() -> Bool {
+            if !isEnabled() {
+                return false
+            }
+
+            guard let replayIntegration, let remoteConfig else {
+                return false
+            }
+
+            return replayIntegration.isActive()
+                && !sessionManager.getSessionId(readOnly: true).isNilOrEmpty
+                && remoteConfig.isSessionReplayFlagActive()
+        }
+    #endif
+
+    #if os(iOS) || targetEnvironment(macCatalyst)
+        /// Returns whether UIKit or SwiftUI element autocapture is enabled in local state.
+        ///
+        /// - Returns: `true` when the SDK is set up and either interaction autocapture option is enabled.
+        ///   This does not verify that the swizzling-backed integration was installed.
+        @objc public func isAutocaptureActive() -> Bool {
+            isEnabled() && (config.captureElementInteractions || config.captureSwiftUIElementInteractions)
+        }
+
+        /// Returns whether rage click autocapture is enabled in local state.
+        ///
+        /// - Returns: `true` when the SDK is set up and rage click detection is enabled.
+        ///   This does not verify that the swizzling-backed integration was installed.
+        @objc public func isRageClickActive() -> Bool {
+            isEnabled() && config.rageClickConfig.enabled
+        }
+    #endif
+
+    // MARK: - Error Tracking
+
+    /// Capture a Swift Error or NSError
+    ///
+    /// Captures an error as a `$exception` event with full stack trace and error chain information.
+    /// The error will be marked as handled by default.
+    ///
+    /// Example:
+    /// ```swift
+    /// do {
+    ///     try FileManager.default.removeItem(at: badFileUrl)
+    /// } catch {
+    ///     TxlemetrySDK.shared.captureException(error)
+    /// }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - error: The error to capture (can be any Error or NSError)
+    ///   - properties: Optional additional properties to attach to the event
+    ///
+    @objc(captureExceptionWithError:properties:)
+    public func captureException(
+        _ error: Error,
+        properties: [String: Any]? = nil
+    ) {
+        guard isEnabled() else { return }
+
+        let errorProperties = TxlemetryExceptionProcessor.errorToProperties(
+            error,
+            handled: true,
+            config: config.errorTrackingConfig
+        )
+
+        captureExceptionEvent(errorProperties, additionalProperties: properties)
+    }
+
+    /// Capture a Swift Error or NSError without additional properties
+    ///
+    /// Convenience overload for Objective-C callers so `properties:` doesn't need to be passed as `nil`.
+    ///
+    /// - Parameter error: The error to capture (can be any Error or NSError)
+    ///
+    @objc(captureExceptionWithError:)
+    public func captureException(
+        _ error: Error
+    ) {
+        captureException(error, properties: nil)
+    }
+
+    /// Capture an NSException
+    ///
+    /// Captures an NSException as a `$exception` event with full stack trace.
+    /// This is useful for Objective-C code that uses NSException.
+    ///
+    /// Example:
+    /// ```objc
+    /// @try {
+    ///     [self riskyOperation];
+    /// } @catch (NSException *exception) {
+    ///     [[TxlemetrySDK shared] captureExceptionWithNSException:exception properties:nil];
+    /// }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - exception: The NSException to capture
+    ///   - properties: Optional additional properties to attach to the event
+    ///
+    @objc(captureExceptionWithNSException:properties:)
+    public func captureException(
+        _ exception: NSException,
+        properties: [String: Any]? = nil
+    ) {
+        guard isEnabled() else { return }
+
+        let exceptionProperties = TxlemetryExceptionProcessor.exceptionToProperties(
+            exception,
+            handled: true,
+            config: config.errorTrackingConfig
+        )
+
+        captureExceptionEvent(exceptionProperties, additionalProperties: properties)
+    }
+
+    /// Capture an NSException without additional properties
+    ///
+    /// Convenience overload for Objective-C callers so `properties:` doesn't need to be passed as `nil`.
+    ///
+    /// - Parameter exception: The NSException to capture
+    ///
+    @objc(captureExceptionWithNSException:)
+    public func captureException(
+        _ exception: NSException
+    ) {
+        captureException(exception, properties: nil)
+    }
+
+    /// Record an exception step (breadcrumb-style context record).
+    ///
+    /// Steps accumulate in a session-scoped buffer and are attached to **every** captured `$exception`
+    /// as `$exception_steps`, giving the error tracking UI a timeline of recent activity before each
+    /// error. The buffer is not cleared by a capture — it rotates only by byte-budget eviction and is
+    /// cleared on a clean launch or `close()`. On a fatal crash the buffered steps are persisted with
+    /// the crash context and attached to the crash `$exception` reported on the next launch.
+    ///
+    /// Reserved keys `$message` and `$timestamp` are stripped from `properties` — the SDK sets the
+    /// canonical values. The `$timestamp` is captured at call time so the timeline stays accurate.
+    /// This method never throws and never blocks; a failed step is silently skipped.
+    ///
+    /// Example:
+    /// ```swift
+    /// TxlemetrySDK.shared.addExceptionStep("User tapped Checkout", properties: ["screen": "cart"])
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - message: A short, non-empty description of what happened. Empty messages are ignored.
+    ///   - properties: Optional additional context to attach to the step.
+    ///
+    @objc(addExceptionStep:properties:)
+    public func addExceptionStep(_ message: String, properties: [String: Any]? = nil) {
+        guard isEnabled(), !isOptOutState() else { return }
+
+        guard config.errorTrackingConfig.exceptionSteps.enabled else {
+            hedgeLog("addExceptionStep called but exception steps are disabled, ignoring")
+            return
+        }
+
+        guard !message.isEmpty else {
+            hedgeLog("addExceptionStep called with an empty message, ignoring")
+            return
+        }
+
+        guard let buffer = exceptionStepsBuffer else { return }
+
+        // Strip reserved keys from caller-supplied properties — the SDK owns $message/$timestamp.
+        var step: [String: Any] = [:]
+        if let properties {
+            for (key, value) in properties {
+                if key == TxlemetryExceptionStepFields.message || key == TxlemetryExceptionStepFields.timestamp {
+                    hedgeLog("addExceptionStep: reserved key \(key) in properties is ignored")
+                    continue
+                }
+                step[key] = value
+            }
+        }
+        step[TxlemetryExceptionStepFields.message] = message
+        step[TxlemetryExceptionStepFields.timestamp] = toISO8601String(now())
+
+        buffer.add(step)
+    }
+
+    /// Record an exception step without additional properties.
+    ///
+    /// Convenience overload for Objective-C callers so `properties:` doesn't need to be passed as `nil`.
+    ///
+    /// - Parameter message: A short, non-empty description of what happened.
+    ///
+    @objc(addExceptionStep:)
+    public func addExceptionStep(_ message: String) {
+        addExceptionStep(message, properties: nil)
+    }
+
+    /// Create the steps buffer once. Steps recorded this run are kept in memory for non-fatal
+    /// exceptions; on every change the buffer publishes them via `onExceptionStepsChanged`, which the
+    /// error-tracking integration mirrors into the crash reporter's `customData`.
+    ///
+    /// Must be called under `setupLock`: the create/nil transitions of `exceptionStepsBuffer` (here and
+    /// in `close()`) are confined to it, which keeps this check-then-act atomic against them.
+    private func createExceptionStepsBufferIfNeeded() {
+        guard exceptionStepsBuffer == nil else { return }
+        exceptionStepsBuffer = TxlemetryExceptionStepsBuffer(
+            maxBytes: config.errorTrackingConfig.exceptionSteps.maxBytes,
+            onStepsChanged: { [weak self] steps in self?.onExceptionStepsChanged.invoke(steps) }
+        )
+    }
+
+    /// The session-scoped buffered steps to attach to an exception, or `nil` when disabled or empty.
+    private var attachableExceptionSteps: [[String: Any]]? {
+        guard config.errorTrackingConfig.exceptionSteps.enabled,
+              let buffer = exceptionStepsBuffer
+        else { return nil }
+        let steps = buffer.getAttachable()
+        return steps.isEmpty ? nil : steps
+    }
+
+    private func captureExceptionEvent(
+        _ exceptionProperties: [String: Any],
+        additionalProperties: [String: Any]?
+    ) {
+        var mergedProperties = exceptionProperties
+        additionalProperties?.forEach { mergedProperties[$0.key] = $0.value }
+
+        // ignoredExceptionTypes is enforced in captureInternal, the chokepoint for every $exception path
+        capture("$exception", properties: mergedProperties)
+    }
+
+    private func installIntegrations() {
+        guard installedIntegrations.isEmpty else {
+            hedgeLog("Integrations already installed. Call uninstallIntegrations() first.")
+            return
+        }
+
+        let integrations = config.getIntegrations()
+        var installed: [TxlemetryIntegration] = []
+
+        for integration in integrations {
+            // Skip integrations that require swizzling when swizzling is disabled
+            if integration.requiresSwizzling, !config.enableSwizzling {
+                hedgeLog("Integration \(type(of: integration)) skipped. Integration requires swizzling but enableSwizzling is disabled in config")
+                continue
+            }
+
+            if case let .skipped(reason) = integration.install(self) {
+                hedgeLog("Integration \(type(of: integration)) skipped: \(reason)")
+                continue
+            }
+
+            installed.append(integration)
+
+            #if os(iOS)
+                // TODO: Decouple these two integrations from TxlemetrySDK intance
+                if let replayIntegration = integration as? TxlemetryReplayIntegration {
+                    self.replayIntegration = replayIntegration
+                }
+
+                if let surveysIntegration = integration as? TxlemetrySurveyIntegration {
+                    self.surveysIntegration = surveysIntegration
+                }
+            #endif
+
+            hedgeLog("Integration \(type(of: integration)) installed")
+        }
+
+        installedIntegrations = installed
+    }
+
+    #if os(iOS)
+        private func installReplayIntegration() {
+            guard replayIntegration == nil else { return }
+
+            let integration = TxlemetryReplayIntegration()
+            let installOutcome = integration.install(self)
+            if case let .skipped(reason) = installOutcome {
+                hedgeLog("Integration \(type(of: integration)) skipped: \(reason)")
+                return
+            }
+
+            installedIntegrations.append(integration)
+            replayIntegration = integration
+            // install() already ran start(), whose crash-context snapshot saw `replayIntegration == nil`
+            // and stamped "disabled"; re-snapshot now that the property is set.
+            notifyContextDidChange()
+
+            hedgeLog("Integration \(type(of: integration)) installed")
+        }
+    #endif
+
+    /// Callable from any thread (e.g. the main-queue `onRemoteConfigLoaded` callback), so the
+    /// mutation runs under `setupLock` like every other `installedIntegrations` access.
+    func removeIntegration(_ integration: TxlemetryIntegration) {
+        let id = ObjectIdentifier(integration)
+        setupLock.withLock {
+            integration.uninstall(self)
+            installedIntegrations.removeAll { ObjectIdentifier($0) == id }
+        }
+        hedgeLog("Integration \(type(of: integration)) removed")
+    }
+
+    /// Installs a single integration after initial setup, tracking it for teardown. Twin of
+    /// `removeIntegration`, for integrations that install lazily once remote config lands (e.g.
+    /// error-tracking autocapture re-enabled by a live `/config` after a cached-disabled start).
+    /// Callable from any thread; runs under `setupLock` like every other `installedIntegrations` access.
+    func addIntegration(_ integration: TxlemetryIntegration) {
+        setupLock.withLock {
+            let id = ObjectIdentifier(integration)
+            guard !installedIntegrations.contains(where: { ObjectIdentifier($0) == id }) else { return }
+            guard case .installed = integration.install(self) else { return }
+            installedIntegrations.append(integration)
+            hedgeLog("Integration \(type(of: integration)) added")
+        }
+    }
+
+    private func uninstallIntegrations() {
+        for integration in installedIntegrations {
+            integration.uninstall(self)
+            hedgeLog("Integration \(type(of: integration)) uninstalled")
+        }
+        installedIntegrations = []
+
+        #if os(iOS)
+            replayIntegration = nil
+            surveysIntegration = nil
+        #endif
+    }
+
+    /// Point-in-time counters: the crash path replays the context snapshot verbatim on the next
+    /// launch, so these would be stale by definition. Status/config keys stay because the replay
+    /// integration re-notifies on every recording transition.
+    private static let pointInTimeDebugKeys = [
+        "$sdk_debug_current_session_duration",
+        "$sdk_debug_pending_queue_size",
+        "$sdk_debug_replay_internal_buffer_length",
+    ]
+
+    /// Notifies all installed integrations that the event context has changed.
+    ///
+    /// This is called after operations that modify the context (identify, reset, group, register)
+    /// and by the replay integration whenever `$recording_status` changes. Integrations like crash
+    /// reporting use this to persist context for crash-time capture.
+    func notifyContextDidChange() {
+        guard isEnabled() else { return }
+
+        let distinctId = getDistinctId()
+
+        var eventProperties = buildProperties(
+            distinctId: distinctId,
+            properties: nil,
+            userProperties: nil,
+            userPropertiesSetOnce: nil,
+            groups: nil,
+            appendSharedProps: true,
+            timestamp: nil,
+            readOnlySession: true
+        )
+        for key in Self.pointInTimeDebugKeys {
+            eventProperties.removeValue(forKey: key)
+        }
+
+        // Build crash context with identity info + event properties
+        // This structure allows crash reporting to reconstruct events with crash-time data
+        let context: [String: Any] = [
+            "distinct_id": distinctId,
+            "event_properties": eventProperties,
+        ]
+
+        onEventContextChanged.invoke(context)
+    }
+
+    /// Replays the current buffered steps to subscribers (e.g. a crash writer just installed on opt-in).
+    ///
+    /// The steps buffer survives opt-out, so a freshly subscribed crash writer would otherwise hold the
+    /// context but empty steps until the next `addExceptionStep`; a crash in that window would drop the
+    /// buffered steps from the on-disk report. Guarded like `addExceptionStep`: steps follow opt-out.
+    private func notifyExceptionStepsDidChange() {
+        guard isEnabled(), !isOptOutState() else { return }
+
+        if let steps = exceptionStepsBuffer?.getAttachable(), !steps.isEmpty {
+            onExceptionStepsChanged.invoke(steps)
+        }
+    }
+
+    // MARK: - Push Notifications
+
+    #if os(iOS)
+        /// Sends a device push token to Txlemetry so Workflows can deliver push notifications to this device.
+        ///
+        /// Call this from `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)` when you don't
+        /// rely on automatic swizzling (for example when `enableSwizzling` is `false`).
+        ///
+        /// The token is linked to the current distinct id, so it follows the user across `identify(_:)`.
+        ///
+        /// - Note: Push registration is available on iOS only in this version.
+        ///
+        /// - Parameter deviceToken: The APNs token as a lowercase-hex string. Convert a `Data` token via
+        ///   `token.map { String(format: "%02x", $0) }.joined()`.
+        @objc public func registerPushNotificationToken(_ deviceToken: String) {
+            registerPushNotificationToken(deviceToken, appId: nil)
+        }
+
+        /// Sends a device push token to Txlemetry under an explicit app id.
+        ///
+        /// Use the `appId` overload when relaying a token obtained through another provider (for example a
+        /// Firebase `project_id`). When `appId` is `nil` the app's bundle identifier is used.
+        ///
+        /// - Note: Push registration is available on iOS only in this version.
+        ///
+        /// - Parameters:
+        ///   - deviceToken: The push token string (APNs lowercase-hex, or an FCM token verbatim).
+        ///   - appId: The app identifier the token belongs to, or `nil` to use the bundle identifier.
+        @objc public func registerPushNotificationToken(_ deviceToken: String, appId: String?) {
+            if !isEnabled() {
+                return
+            }
+
+            if isOptOutState() {
+                return
+            }
+
+            pushSubscriptionHandler?.send(deviceToken: deviceToken, appId: appId)
+        }
+
+        /// Unregisters this device's push token from Txlemetry so Workflows stop targeting it — for example
+        /// from your logout flow.
+        ///
+        /// Sends a `DELETE /api/push_subscriptions/` for the identity the token was delivered to — the
+        /// current distinct id when nothing was delivered yet — so the backend unsets the subscription
+        /// property on the person that actually holds it, and forgets the locally stored token. The
+        /// delete intent is durable: an offline or failed attempt is retried on `flush()`/next launch
+        /// until it succeeds or hits a terminal 4xx. Call it directly if you manage push subscriptions
+        /// yourself. On `reset()` the SDK already moves any registered token to the new anonymous
+        /// identity (unregister then re-register), independently of
+        /// `capturePushNotificationSubscriptions` — that flag only gates automatic token subscription
+        /// at startup.
+        @objc public func unregisterPushNotificationToken() {
+            if !isEnabled() {
+                return
+            }
+
+            if isOptOutState() {
+                return
+            }
+
+            pushSubscriptionHandler?.unregisterCurrentToken()
+        }
+    #endif
+
+    #if os(iOS) || os(macOS)
+        /// Installs the notification-open swizzles before `setup()` is called.
+        ///
+        /// A cold launch from a notification tap delivers the response to the app within a few hundred
+        /// milliseconds — sooner than a cross-platform host (Flutter, React Native) can reach its own
+        /// `setup()` call from the Dart/JS runtime, so the swizzles are not yet in place and the open is
+        /// lost. Call this from `application(_:didFinishLaunchingWithOptions:)`, or from a plugin
+        /// registration that runs inside it, and the response is held until `setup()` installs the
+        /// integration, which then captures it.
+        ///
+        /// Holds at most one response, and only replays it when `setup()` follows within 30 seconds.
+        /// Native iOS apps that call `setup()` from `didFinishLaunchingWithOptions` do not need this.
+        ///
+        /// The swizzles are installed immediately and released again when the last subscriber detaches
+        /// (`close()`), or at `setup()` when the config disables push-open capture or the app is
+        /// opted out. If `setup()` is never called they stay for the process lifetime. The per-class
+        /// delegate wrapper, as elsewhere in this SDK, stays for the process lifetime regardless.
+        @available(iOS 14.0, macOS 11.0, *)
+        @objc public static func prewarmPushNotificationOpenCapture() {
+            DI.main.pushNotificationPublisher.prewarmNotificationResponseCapture()
+        }
+
+        /// Manually captures a `$push_notification_opened` event for a notification the user tapped.
+        ///
+        /// Use this when you're not relying on the automatic swizzling installed by
+        /// `capturePushNotificationOpened`, for example when `enableSwizzling` is `false` or when you
+        /// manage your own `UNUserNotificationCenterDelegate`. Call it from your
+        /// `userNotificationCenter(_:didReceive:withCompletionHandler:)` implementation.
+        ///
+        /// The notification's title/subtitle/body are included only when the push is attributed to
+        /// Txlemetry (a `txlemetry` key in its `userInfo`); unattributed pushes capture the open event
+        /// without content. Use the field-based overload to capture content explicitly.
+        ///
+        /// A notification sent by Txlemetry is captured once: when the `txlemetry` entry of `userInfo`
+        /// carries an `invocation_id`, a repeat with the same `invocation_id` and `action_id` within
+        /// 5 minutes of the first capture is skipped, whether that first capture came from this
+        /// method, from the field-based overload, or from the SDK's automatic capture. Notifications
+        /// without a `txlemetry.invocation_id` are always captured. Only the 20 most recently captured
+        /// notifications are remembered, so a host that reports more than that inside the window can
+        /// capture a repeat of the oldest.
+        ///
+        /// A rerun of that workflow, or a loop back to its push step, sends the pair again as a new
+        /// notification, and its open counts separately: two responses whose
+        /// `notification.request.identifier` differ are two taps, not one reported twice.
+        ///
+        /// - Parameter response: The `UNNotificationResponse` received from the system.
+        @available(iOS 14.0, macOS 11.0, *)
+        @objc public func capturePushNotificationOpened(response: UNNotificationResponse) {
+            let content = response.notification.request.content
+            // Free-text content is captured only for Txlemetry-attributed pushes: forwarding the
+            // title/body of arbitrary third-party notifications (OTPs, chat previews) would ship
+            // sensitive text to analytics by default. The field-based overload stays ungated —
+            // there the developer passes content explicitly.
+            let isTxlemetryNotification = content.userInfo["posthog"] != nil
+            capturePushNotificationOpened(
+                title: isTxlemetryNotification ? content.title : nil,
+                subtitle: isTxlemetryNotification ? content.subtitle : nil,
+                body: isTxlemetryNotification ? content.body : nil,
+                payload: content.userInfo,
+                action: response.actionIdentifier,
+                deliveryId: response.notification.request.identifier
+            )
+        }
+
+        /// Manually captures a `$push_notification_opened` event from raw notification fields.
+        ///
+        /// Use this when no `UNNotificationResponse` is available — for example when you handle a push
+        /// yourself in `application(_:didReceiveRemoteNotification:fetchCompletionHandler:)` or relay it
+        /// from a cross-platform layer.
+        ///
+        /// A notification sent by Txlemetry is captured once: when `payload["txlemetry"]` carries an
+        /// `invocation_id`, a repeat with the same `invocation_id` and `action_id` within 5 minutes
+        /// of the first capture is skipped, whether that first capture came from this method or from
+        /// the SDK's automatic capture. Payloads without a `txlemetry.invocation_id` are always
+        /// captured. Only the 20 most recently captured notifications are remembered, so a host that
+        /// reports more than that inside the window can capture a repeat of the oldest.
+        /// This overload carries no notification identifier, so a rerun of that workflow
+        /// reported through it inside the window reads as the same tap and is skipped; report a rerun
+        /// through `capturePushNotificationOpened(response:)`, which can tell the deliveries apart.
+        ///
+        /// - Parameters:
+        ///   - title: The notification title; omitted from the event when `nil` or empty.
+        ///   - subtitle: The notification subtitle; omitted when `nil` or empty.
+        ///   - body: The notification body; omitted when `nil` or empty.
+        ///   - payload: The notification payload (`userInfo`). The keys of its `txlemetry` entry — a
+        ///     dictionary, or a JSON string when relayed through FCM — become `$notification_<key>`
+        ///     properties.
+        ///   - action: The action identifier for an action-button tap; leave `nil` for a plain tap
+        ///     (the default action is omitted from the event).
+        @objc public func capturePushNotificationOpened(
+            title: String? = nil,
+            subtitle: String? = nil,
+            body: String? = nil,
+            payload: [AnyHashable: Any]? = nil,
+            action: String? = nil
+        ) {
+            capturePushNotificationOpened(
+                title: title,
+                subtitle: subtitle,
+                body: body,
+                payload: payload,
+                action: action,
+                deliveryId: nil
+            )
+        }
+
+        /// - Parameter deliveryId: The system's id for the delivered notification
+        ///   (`UNNotificationResponse.notification.request.identifier`), which separates a second
+        ///   notification from a second report of one tap. Only the `response:` overload has one; a caller
+        ///   passing raw fields does not, which is why this stays off the public API. Not `private`
+        ///   because `UNNotificationResponse` has no initializer, so tests reach the delivery-id paths
+        ///   only through here.
+        func capturePushNotificationOpened(
+            title: String?,
+            subtitle: String?,
+            body: String?,
+            payload: [AnyHashable: Any]?,
+            action: String?,
+            deliveryId: String?
+        ) {
+            if !isEnabled() {
+                return
+            }
+
+            if isOptOutState() {
+                return
+            }
+
+            let txlemetryData = txlemetryPayload(from: payload?["posthog"])
+            if !recordPushOpen(txlemetryData, deliveryId: deliveryId) {
+                return
+            }
+
+            var properties: [String: Any] = [:]
+
+            if let title, !title.isEmpty {
+                properties["$notification_title"] = title
+            }
+
+            if let subtitle, !subtitle.isEmpty {
+                properties["$notification_subtitle"] = subtitle
+            }
+
+            if let body, !body.isEmpty {
+                properties["$notification_body"] = body
+            }
+
+            if let txlemetryData {
+                for (key, value) in txlemetryData {
+                    properties["$notification_\(key)"] = value
+                }
+            }
+
+            if let action, !action.isEmpty, action != UNNotificationDefaultActionIdentifier {
+                properties["$notification_action"] = action
+            }
+
+            capture("$push_notification_opened", properties: properties)
+        }
+
+        /// The `txlemetry` attribution payload arrives as a dictionary when delivered through APNs
+        /// directly, but as a JSON string when relayed through FCM (`message.data` is string→string).
+        private func txlemetryPayload(from value: Any?) -> [String: Any]? {
+            if let dict = value as? [String: Any] {
+                return dict
+            }
+            if let string = value as? String {
+                if let data = string.data(using: .utf8), let dict = fromJSONData(data) {
+                    return dict
+                }
+                hedgeLog("Push notification 'posthog' payload is not a JSON object; ignoring.")
+            }
+            return nil
+        }
+
+        /// A duplicate report of one tap arrives within the same launch: milliseconds after a warm tap,
+        /// seconds after a cold start while the host's JS/Dart handlers register. Finite so that a re-send
+        /// carrying no delivery id to tell it apart still counts once the window has passed.
+        private static let pushOpenDedupeWindow: TimeInterval = 5 * 60
+
+        /// Only the opens of the last few minutes matter; the cap bounds memory for a host that calls the
+        /// API in bulk.
+        private static let maxRecentPushOpens = 20
+
+        /// Recently captured Txlemetry push opens, keyed by `invocation_id/action_id`, oldest first —
+        /// appended at the back, evicted from the front. Notification callbacks and manual calls arrive on
+        /// different threads, so the buffer is only touched under its lock. In memory only: both reports
+        /// of one tap happen in the same launch.
+        private var recentPushOpens: [RecentPushOpen] = []
+        private let recentPushOpensLock = NSLock()
+
+        private struct RecentPushOpen {
+            let key: String
+            let capturedAt: Date
+            let deliveryId: String?
+        }
+
+        /// Records a Txlemetry push open, returning `false` when the same notification was already captured
+        /// inside the dedupe window and this report should be skipped.
+        private func recordPushOpen(_ txlemetryData: [String: Any]?, deliveryId: String?) -> Bool {
+            guard let invocationId = txlemetryData?["invocation_id"] as? String, !invocationId.isEmpty else {
+                return true
+            }
+            // Every step of one workflow run shares the run's invocation_id, so action_id tells the steps apart.
+            let key = "\(invocationId)/\(txlemetryData?["action_id"] as? String ?? "")"
+
+            return recentPushOpensLock.withLock {
+                // Sampled under the lock so two concurrent reports can't be admitted out of order and read
+                // the inversion as a backwards clock.
+                let capturedAt = now()
+                if let index = recentPushOpens.firstIndex(where: { $0.key == key }) {
+                    let previous = recentPushOpens[index]
+                    // A negative gap means the wall clock moved back; capture rather than risk dropping an open.
+                    let elapsed = capturedAt.timeIntervalSince(previous.capturedAt)
+                    let insideWindow = elapsed >= 0 && elapsed < Self.pushOpenDedupeWindow
+                    // A re-send of the same workflow step reuses the key, so only delivery ids that are
+                    // present on both reports and disagree prove a second notification rather than a second
+                    // report of one tap.
+                    let resent = previous.deliveryId != nil && deliveryId != nil && previous.deliveryId != deliveryId
+                    if insideWindow, !resent {
+                        hedgeLog("Skipped $push_notification_opened: notification \(key) was already captured.")
+                        return false
+                    }
+                    recentPushOpens.remove(at: index)
+                }
+                recentPushOpens.append(RecentPushOpen(key: key, capturedAt: capturedAt, deliveryId: deliveryId))
+                if recentPushOpens.count > Self.maxRecentPushOpens {
+                    recentPushOpens.removeFirst()
+                }
+                return true
+            }
+        }
+    #endif
+}
+
+#if TESTING
+    extension TxlemetrySDK {
+        #if os(iOS) || targetEnvironment(macCatalyst)
+            func getAutocaptureIntegration() -> TxlemetryAutocaptureIntegration? {
+                getIntegration()
+            }
+
+            func getRageClickIntegration() -> TxlemetryRageClickIntegration? {
+                getIntegration()
+            }
+        #endif
+
+        #if os(iOS)
+            func getReplayIntegration() -> TxlemetryReplayIntegration? {
+                getIntegration()
+            }
+        #endif
+
+        #if os(iOS) || os(macOS) || os(tvOS)
+            func getErrorTrackingIntegration() -> TxlemetryErrorTrackingAutoCaptureIntegration? {
+                getIntegration()
+            }
+        #endif
+
+        #if os(iOS) || os(macOS)
+            @available(iOS 14.0, macOS 11.0, *)
+            func getPushNotificationIntegration() -> TxlemetryPushNotificationOpenIntegration? {
+                getIntegration()
+            }
+
+        #endif
+
+        #if os(iOS)
+            @available(iOS 14.0, *)
+            func getPushNotificationSubscriptionIntegration() -> TxlemetryPushNotificationSubscriptionIntegration? {
+                getIntegration()
+            }
+        #endif
+
+        func getSessionManager() -> TxlemetrySessionManager? {
+            sessionManager
+        }
+
+        func getAppLifeCycleIntegration() -> TxlemetryAppLifeCycleIntegration? {
+            getIntegration()
+        }
+
+        func getScreenViewIntegration() -> TxlemetryScreenViewIntegration? {
+            getIntegration()
+        }
+
+        private func getIntegration<T: TxlemetryIntegration>() -> T? {
+            setupLock.withLock {
+                installedIntegrations.compactMap { $0 as? T }.first
+            }
+        }
+    }
+#endif
+
+// swiftlint:enable file_length cyclomatic_complexity

@@ -1,0 +1,20 @@
+//
+//  Hedgelog.swift
+//  Txlemetry
+//
+//  Created by Ben White on 07.02.23.
+//
+
+import Foundation
+
+var hedgeLogEnabled = false
+
+func toggleHedgeLog(_ enabled: Bool) {
+    hedgeLogEnabled = enabled
+}
+
+// Meant for internally logging Txlemetry related things
+func hedgeLog(_ message: String) {
+    if !hedgeLogEnabled { return }
+    print("[Txlemetry] \(message)")
+}

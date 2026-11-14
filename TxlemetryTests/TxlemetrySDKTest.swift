@@ -1,0 +1,1635 @@
+//
+//  TxlemetrySDKTest.swift
+//  TxlemetryTests
+//
+//  Created by Manoel Aranda Neto on 31.10.23.
+//
+
+import Foundation
+import Nimble
+@testable import Txlemetry
+#if SWIFT_PACKAGE
+    import TxlemetryTestsObjC
+#endif
+import Quick
+import XCTest
+
+class TxlemetrySDKTest: QuickSpec {
+    // Every SDK getSut creates is tracked and closed in afterEach. An unclosed SDK leaks its
+    // queues, timers, URLSession and observers; across ~40 instances per run those pile up and
+    // starve the background thread pool, stalling async work (flag loads, flushes) on CI.
+    private var trackedSuts: [TxlemetrySDK] = []
+
+    func getSut(preloadFeatureFlags: Bool = false,
+                sendFeatureFlagEvent: Bool = false,
+                captureApplicationLifecycleEvents: Bool = false,
+                flushAt: Int = 1,
+                optOut: Bool = false,
+                propertiesSanitizer: TxlemetryPropertiesSanitizer? = nil,
+                personProfiles: TxlemetryPersonProfiles = .identifiedOnly,
+                setDefaultPersonProperties: Bool = true,
+                beforeSend: [BeforeSendBlock]? = nil) -> TxlemetrySDK
+    {
+        let config = TxlemetryConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+        config.flushAt = flushAt
+        config.preloadFeatureFlags = preloadFeatureFlags
+        config.sendFeatureFlagEvent = sendFeatureFlagEvent
+        config.disableReachabilityForTesting = true
+        config.disableQueueTimerForTesting = true
+        config.disableFlushOnBackgroundForTesting = true
+        config.captureApplicationLifecycleEvents = captureApplicationLifecycleEvents
+        config.optOut = optOut
+        config.propertiesSanitizer = propertiesSanitizer
+        config.personProfiles = personProfiles
+        config.setDefaultPersonProperties = setDefaultPersonProperties
+
+        if let beforeSend = beforeSend {
+            config.setBeforeSend(beforeSend)
+        }
+
+        let storage = TxlemetryStorage(config)
+        storage.reset()
+
+        let sut = TxlemetrySDK.with(config)
+        trackedSuts.append(sut)
+        return sut
+    }
+
+    func getBeforeSendEventsConfig() -> [BeforeSendTestEventContext] {
+        [
+            .init(
+                triggerClosure: { $0.capture("test_event") },
+                targetKey: "test_event",
+                testName: "capture"
+            ),
+            .init(
+                triggerClosure: { $0.screen("screen_name") },
+                targetKey: "$screen",
+                testName: "screen"
+            ),
+            .init(
+                triggerClosure: { $0.autocapture(eventType: "test_type", elementsChain: "chain", properties: [:]) },
+                targetKey: "$autocapture",
+                testName: "autocapture"
+            ),
+            .init(
+                triggerClosure: { $0.identify("user_id") },
+                targetKey: "$identify",
+                testName: "identify"
+            ),
+            .init(
+                triggerClosure: { $0.group(type: "test_type", key: "test_key") },
+                targetKey: "$groupidentify",
+                testName: "group"
+            ),
+            .init(
+                triggerClosure: { $0.alias("test_alias") },
+                targetKey: "$create_alias",
+                testName: "alias"
+            ),
+            .init(
+                triggerClosure: { _ = $0.getFeatureFlag("key") },
+                targetKey: "$feature_flag_called",
+                testName: "get feature flag"
+            ),
+        ]
+    }
+
+    override func spec() {
+        var server: MockTxlemetryServer!
+        let mockAppLifecycle = MockApplicationLifecyclePublisher()
+
+        func deleteDefaults() {
+            let userDefaults = UserDefaults.standard
+            userDefaults.removeObject(forKey: "PHGVersionKey")
+            userDefaults.removeObject(forKey: "PHGBuildKeyV2")
+            userDefaults.synchronize()
+
+            deleteSafely(applicationSupportDirectoryURL())
+        }
+
+        beforeEach {
+            TxlemetryAppLifeCycleIntegration.clearInstalls()
+
+            deleteDefaults()
+            server = MockTxlemetryServer(version: 4)
+            server.start()
+
+            DI.main.appLifecyclePublisher = mockAppLifecycle
+        }
+        afterEach {
+            now = { Date() }
+            // Close every SDK created this test so its queues/timers/observers don't leak into the
+            // next one (close() is idempotent, so tests that already closed their sut are fine).
+            self.trackedSuts.forEach { $0.close() }
+            self.trackedSuts.removeAll()
+            server.stop()
+            server = nil
+        }
+
+        it("no-ops setup when project token is empty after trimming") {
+            let config = TxlemetryConfig(projectToken: " \n\t ", host: "http://localhost:9001")
+
+            let sut = TxlemetrySDK.with(config)
+
+            expect(sut.config.projectToken).to(beEmpty())
+            expect(sut.storage).to(beNil())
+            expect(sut.getDistinctId()).to(beEmpty())
+            expect(sut.getSessionId()).to(beNil())
+        }
+
+        it("no-ops setup when legacy api key is empty after trimming") {
+            let config = TxlemetryConfig(apiKey: " \n\t ", host: "http://localhost:9001")
+
+            let sut = TxlemetrySDK.with(config)
+
+            expect(sut.config.projectToken).to(beEmpty())
+            expect(sut.storage).to(beNil())
+            expect(sut.getDistinctId()).to(beEmpty())
+            expect(sut.getSessionId()).to(beNil())
+        }
+
+        func bootstrapReconcileConfig(existing: (anon: String, distinct: String?, identified: Bool)) -> TxlemetryConfig {
+            let config = TxlemetryConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+
+            let storage = TxlemetryStorage(config)
+            storage.reset()
+            storage.setString(forKey: .anonymousId, contents: existing.anon)
+            if let distinct = existing.distinct {
+                storage.setString(forKey: .distinctId, contents: distinct)
+            }
+            if existing.identified {
+                storage.setBool(forKey: .isIdentified, contents: true)
+            }
+            return config
+        }
+
+        it("merges an anonymous local user into an identified bootstrap") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-abc", distinct: nil, identified: false))
+            config.bootstrap = TxlemetryBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // the anonymous user is merged into the identified bootstrap ID
+            expect(sut.getDistinctId()) == "user-123"
+            expect(config.storageManager?.isIdentified()) == true
+            // the anonymous ID is preserved so the $identify links the merge ($anon_distinct_id)
+            expect(sut.getAnonymousId()) == "anon-abc"
+        }
+
+        it("preserves a different already-identified local user against an identified bootstrap") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-xyz", distinct: "user-existing", identified: true))
+            config.bootstrap = TxlemetryBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // the existing identity wins; the bootstrap is ignored
+            expect(sut.getDistinctId()) == "user-existing"
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("upgrades a matching anonymous id to identified via an identified bootstrap") {
+            let config = bootstrapReconcileConfig(existing: (anon: "user-123", distinct: nil, identified: false))
+            config.bootstrap = TxlemetryBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // matching id: the user is upgraded to identified without re-linking
+            expect(sut.getDistinctId()) == "user-123"
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("reconciles an identified bootstrap while opted out") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-xyz", distinct: nil, identified: false))
+            config.optOut = true
+            config.bootstrap = TxlemetryBootstrapConfig(distinctId: "user-456", isIdentifiedId: true)
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // opted out: local identity is still reconciled, only event emission is suppressed
+            expect(sut.getDistinctId()) == "user-456"
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("early lifecycle events carry the reconciled bootstrap identity") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-abc", distinct: nil, identified: false))
+            config.captureApplicationLifecycleEvents = true
+            // reconcile emits $identify, then Application Installed captures on install; flush both together
+            config.flushAt = 2
+            config.bootstrap = TxlemetryBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // reconcile runs before installIntegrations, so the Application Installed event captured
+            // synchronously on install carries the merged bootstrap identity, not the old anonymous id
+            let events = getBatchedEvents(server)
+            let installed = events.first { $0.event == "Application Installed" }
+            expect(installed).toNot(beNil())
+            expect(installed?.distinctId) == "user-123"
+        }
+
+        // The .never asymmetry below is intentional txlemetry-js parity: the fresh-install seed applies the
+        // identity via an ungated write, while the returning-anon path routes through identify(), which
+        // no-ops under .never. These lock in that behavior so it isn't "made consistent" by mistake.
+        it("applies an identified bootstrap on a fresh install even when personProfiles is never") {
+            let config = TxlemetryConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+            config.personProfiles = .never
+            TxlemetryStorage(config).reset() // fresh install: no persisted identity
+            config.bootstrap = TxlemetryBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // fresh-install seed applies the identity directly, without the person-processing gate
+            expect(sut.getDistinctId()) == "user-123"
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("drops a differing identified bootstrap for a returning anonymous user when personProfiles is never") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-abc", distinct: nil, identified: false))
+            config.personProfiles = .never
+            config.bootstrap = TxlemetryBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // returning-anon path routes through identify(), which no-ops under .never, so the bootstrap
+            // identity is dropped and the existing anonymous id is preserved
+            expect(sut.getDistinctId()) == "anon-abc"
+            expect(config.storageManager?.isIdentified()) == false
+        }
+
+        it("drops a differing identified bootstrap for a returning anonymous user when personProfiles is never and opted out") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-abc", distinct: nil, identified: false))
+            config.personProfiles = .never
+            config.optOut = true
+            config.bootstrap = TxlemetryBootstrapConfig(distinctId: "user-456", isIdentifiedId: true)
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // .never gates the reconcile regardless of opt-out, so the outcome matches the non-opted-out case above
+            expect(sut.getDistinctId()) == "anon-abc"
+            expect(config.storageManager?.isIdentified()) == false
+        }
+
+        it("identifies an anonymous user via identify() when the id already matches the persisted distinct id") {
+            // Anonymous user whose persisted id already equals the id being identified with
+            // (e.g. a non-identified bootstrap seeded the same id).
+            let config = bootstrapReconcileConfig(existing: (anon: "user-123", distinct: nil, identified: false))
+            config.captureApplicationLifecycleEvents = false
+            config.flushAt = 1
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            sut.identify("user-123")
+
+            // No $identify (nothing to merge); a single person-processed $set marks the transition.
+            let events = getBatchedEvents(server)
+            expect(events.count) == 1
+            expect(events.first?.event) == "$set"
+            expect(events.first?.properties["$process_person_profile"] as? Bool) == true
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("does not emit a second $set on a repeated matching-id identify") {
+            let config = bootstrapReconcileConfig(existing: (anon: "user-123", distinct: nil, identified: false))
+            config.captureApplicationLifecycleEvents = false
+            config.flushAt = 2
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            sut.identify("user-123") // transition: one $set
+            sut.identify("user-123") // already identified: no event
+            sut.capture("event") // flushes the batch (flushAt 2)
+
+            let events = getBatchedEvents(server)
+            expect(events.count) == 2
+            expect(events[0].event) == "$set"
+            expect(events[1].event) == "event"
+        }
+
+        it("forwards userProperties and userPropertiesSetOnce on a matching-id identify") {
+            let config = bootstrapReconcileConfig(existing: (anon: "user-123", distinct: nil, identified: false))
+            config.captureApplicationLifecycleEvents = false
+            config.flushAt = 1
+
+            let sut = TxlemetrySDK.with(config)
+            self.trackedSuts.append(sut)
+
+            sut.identify("user-123", userProperties: ["foo": "bar"], userPropertiesSetOnce: ["baz": "qux"])
+
+            let events = getBatchedEvents(server)
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$set"
+            expect(event.properties["$process_person_profile"] as? Bool) == true
+
+            let set = event.properties["$set"] as? [String: Any] ?? [:]
+            expect(set["foo"] as? String) == "bar"
+
+            let setOnce = event.properties["$set_once"] as? [String: Any] ?? [:]
+            expect(setOnce["baz"] as? String) == "qux"
+
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("captures the capture event") {
+            let sut = self.getSut()
+
+            sut.capture("test event",
+                        properties: ["foo": "bar"],
+                        userProperties: ["userProp": "value"],
+                        userPropertiesSetOnce: ["userPropOnce": "value"],
+                        groups: ["groupProp": "value"])
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "test event"
+
+            expect(event.properties["foo"] as? String) == "bar"
+
+            let set = event.properties["$set"] as? [String: Any] ?? [:]
+            expect(set["userProp"] as? String) == "value"
+
+            let setOnce = event.properties["$set_once"] as? [String: Any] ?? [:]
+            expect(setOnce["userPropOnce"] as? String) == "value"
+
+            let groupProps = event.properties["$groups"] as? [String: String] ?? [:]
+            expect(groupProps["groupProp"]) == "value"
+
+            sut.reset()
+            sut.close()
+        }
+
+        #if os(iOS)
+            it("captures $recording_status and $sdk_debug_* debug properties on custom, screen, and exception events") {
+                server.reset(batchCount: 1)
+                let sut = self.getSut(flushAt: 3)
+
+                sut.capture("test event")
+                sut.screen("theScreen")
+                sut.capture("$exception", properties: ["foo": "bar"])
+
+                let events = getBatchedEvents(server)
+                expect(events.count) == 3
+
+                for event in events {
+                    expect(event.properties["$recording_status"] as? String) == "disabled"
+                    expect(event.properties["$sdk_debug_replay_capture_mode"] as? String) == "wireframe"
+                    expect(event.properties["$sdk_debug_replay_throttle_delay_ms"] as? Int) == 1000
+                    expect(event.properties["$sdk_debug_session_start"]).toNot(beNil())
+                    expect(event.properties["$sdk_debug_current_session_duration"]).toNot(beNil())
+                    expect(event.properties["$sdk_debug_pending_queue_size"]).toNot(beNil())
+                }
+
+                sut.reset()
+                sut.close()
+            }
+
+            it("excludes $recording_status and $sdk_debug_* properties from $snapshot events") {
+                // $snapshot events route to the replay queue and the /s/ endpoint, not /batch —
+                // read the raw request body rather than getBatchedEvents.
+                server.reset(batchCount: 0, snapshotCount: 1)
+                let sut = self.getSut()
+                sut.sessionManager.setSessionId("00000000-0000-7000-8000-000000000099")
+
+                sut.capture("$snapshot", properties: [
+                    "$session_id": "00000000-0000-7000-8000-000000000099",
+                    "$snapshot_source": "mobile",
+                    "$snapshot_data": ["type": 4, "data": ["width": 1, "height": 1], "timestamp": 0] as [String: Any],
+                ])
+                sut.flush()
+
+                let result = XCTWaiter.wait(for: [server.snapshotExpectation!], timeout: testRequestTimeout)
+                expect(result) == .completed
+
+                let request = server.snapshotRequests.first
+                expect(request).toNot(beNil())
+                let body = request.flatMap { server.parseRequest($0, gzip: true) }
+                let props = body?["properties"] as? [String: Any] ?? [:]
+
+                expect(props["$recording_status"]).to(beNil())
+                expect(props.keys.contains { $0.hasPrefix("$sdk_debug_") }).to(beFalse())
+
+                sut.reset()
+                sut.close()
+            }
+
+            it("reports screenshot capture mode for the flutter host") {
+                server.reset(batchCount: 1)
+                let original = txlemetrySdkName
+                txlemetrySdkName = "posthog-flutter"
+                defer { txlemetrySdkName = original }
+
+                let sut = self.getSut()
+                sut.capture("test event")
+
+                let events = getBatchedEvents(server)
+                expect(events.first?.properties["$sdk_debug_replay_capture_mode"] as? String) == "screenshot"
+
+                sut.reset()
+                sut.close()
+            }
+
+            it("SDK-computed debug keys win over a same-named registered super property") {
+                server.reset(batchCount: 1)
+                let sut = self.getSut()
+                sut.register(["$recording_status": "bogus", "$sdk_debug_pending_queue_size": -1])
+
+                sut.capture("test event")
+
+                let events = getBatchedEvents(server)
+                let props = events.first!.properties
+                expect(props["$recording_status"] as? String) == "disabled"
+                expect(props["$sdk_debug_pending_queue_size"] as? Int) != -1
+
+                sut.reset()
+                sut.close()
+            }
+
+        #else
+            it("reports disabled recording status with no replay keys on non-iOS platforms") {
+                server.reset(batchCount: 1)
+                let sut = self.getSut()
+
+                sut.capture("test event")
+
+                let events = getBatchedEvents(server)
+                expect(events.count) == 1
+
+                let props = events.first!.properties
+                expect(props["$recording_status"] as? String) == "disabled"
+                expect(props.keys.contains { $0.hasPrefix("$sdk_debug_replay_") }).to(beFalse())
+                expect(props["$sdk_debug_pending_queue_size"]).toNot(beNil())
+
+                sut.reset()
+                sut.close()
+            }
+        #endif
+
+        it("invokes reloadFeatureFlags callback when not enabled") {
+            let sut = self.getSut()
+            sut.close()
+
+            var called = false
+            sut.reloadFeatureFlags {
+                called = true
+            }
+
+            expect(called).to(beTrue())
+        }
+
+        it("captures a screen event") {
+            let sut = self.getSut()
+
+            sut.screen("theScreen", properties: ["prop": "value"])
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$screen"
+
+            expect(event.properties["$screen_name"] as? String) == "theScreen"
+            expect(event.properties["prop"] as? String) == "value"
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("captures a group event") {
+            let sut = self.getSut()
+
+            sut.group(type: "some-type", key: "some-key", groupProperties: [
+                "name": "some-company-name",
+            ])
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let groupEvent = events.first!
+            expect(groupEvent.event) == "$groupidentify"
+            expect(groupEvent.properties["$group_type"] as? String?) == "some-type"
+            expect(groupEvent.properties["$group_key"] as? String?) == "some-key"
+            expect((groupEvent.properties["$group_set"] as? [String: Any])?["name"] as? String) == "some-company-name"
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("setups optOut") {
+            let sut = self.getSut()
+
+            sut.optOut()
+
+            expect(sut.isOptOut()) == true
+
+            sut.optIn()
+
+            expect(sut.isOptOut()) == false
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sets opt out via config") {
+            let sut = self.getSut(optOut: true)
+
+            sut.optOut()
+
+            expect(sut.isOptOut()) == true
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("removes all integrations on opt-out") {
+            let sut = self.getSut(
+                captureApplicationLifecycleEvents: true,
+                optOut: false
+            )
+
+            expect(sut.getAppLifeCycleIntegration()).notTo(beNil())
+
+            sut.optOut()
+
+            expect(sut.getAppLifeCycleIntegration()).to(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("does not capture event if opt out") {
+            let sut = self.getSut()
+
+            sut.optOut()
+
+            sut.capture("event")
+
+            // no need to await 15s
+            let events = getBatchedEvents(server, timeout: 1.0, failIfNotCompleted: false)
+            expect(events.count) == 0
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("calls reloadFeatureFlags") {
+            let sut = self.getSut()
+
+            let group = DispatchGroup()
+            group.enter()
+
+            sut.reloadFeatureFlags {
+                group.leave()
+            }
+
+            group.wait()
+
+            expect(sut.isFeatureEnabled("bool-value")) == true
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("loads feature flags automatically") {
+            let sut = self.getSut(preloadFeatureFlags: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("bool-value")) == true
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("send feature flag event for isFeatureEnabled when enabled") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("bool-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag"] as? String) == "bool-value"
+            expect(event.properties["$feature_flag_response"] as? Bool) == true
+            expect(event.properties["$feature_flag_request_id"] as? String) == "0f801b5b-0776-42ca-b0f7-8375c95730bf"
+            expect(event.properties["$feature_flag_id"] as? Int) == 2
+            expect(event.properties["$feature_flag_version"] as? Int) == 23
+            expect(event.properties["$feature_flag_reason"] as? String) == "Matched condition set 3"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == true
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("send feature flag event with variant response for isFeatureEnabled when enabled") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("string-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag"] as? String) == "string-value"
+            expect(event.properties["$feature_flag_response"] as? String) == "test"
+            expect(event.properties["$feature_flag_request_id"] as? String) == "0f801b5b-0776-42ca-b0f7-8375c95730bf"
+            expect(event.properties["$feature_flag_id"] as? Int) == 3
+            expect(event.properties["$feature_flag_version"] as? Int) == 1
+            expect(event.properties["$feature_flag_reason"] as? String) == "Matched condition set 1"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == false
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("send feature flag event without has_experiment when server omits it") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("number-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag"] as? String) == "number-value"
+            expect(event.properties["$feature_flag_has_experiment"]).to(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sends minimal feature flag event when gated and flag has no experiment") {
+            server.minimalFlagCalledEvents = true
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("string-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            // Strict allowlist: everything else (super properties, $active_feature_flags,
+            // $feature/<key>, $is_identified) is stripped; $os_name/$os_version/$app_version
+            // survive as mobile's OS- and app-version-breakdown analog.
+            expect(Set(event.properties.keys)) == Set([
+                "$feature_flag",
+                "$feature_flag_response",
+                "$feature_flag_has_experiment",
+                "$feature_flag_id",
+                "$feature_flag_version",
+                "$feature_flag_reason",
+                "$feature_flag_request_id",
+                "$feature_flag_evaluated_at",
+                "$process_person_profile",
+                "$session_id",
+                "$lib",
+                "$lib_version",
+                "$os_name",
+                "$os_version",
+                "$app_version",
+            ])
+            expect(event.properties["$feature_flag"] as? String) == "string-value"
+            expect(event.properties["$feature_flag_response"] as? String) == "test"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == false
+            // Not on the allowlist, so the minimal shape must never carry the replay debug envelope.
+            expect(event.properties["$recording_status"]).to(beNil())
+            expect(event.properties.keys.contains { $0.hasPrefix("$sdk_debug_") }).to(beFalse())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("keeps $groups on minimal feature flag events") {
+            server.minimalFlagCalledEvents = true
+            // flushAt 2 so the $groupidentify and $feature_flag_called events share one batch
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true, flushAt: 2)
+
+            waitForFeatureFlagsLoaded(server, sut)
+
+            sut.group(type: "some-type", key: "some-key")
+
+            expect(sut.isFeatureEnabled("string-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 2
+
+            let event = events.last!
+            expect(event.event) == "$feature_flag_called"
+            // $groups is correctness-required (ingestion dedup key + personful routing for group
+            // flags), so it must survive minimization when groups are registered.
+            expect(Set(event.properties.keys)) == Set([
+                "$feature_flag",
+                "$feature_flag_response",
+                "$feature_flag_has_experiment",
+                "$feature_flag_id",
+                "$feature_flag_version",
+                "$feature_flag_reason",
+                "$feature_flag_request_id",
+                "$feature_flag_evaluated_at",
+                "$groups",
+                "$process_person_profile",
+                "$session_id",
+                "$lib",
+                "$lib_version",
+                "$os_name",
+                "$os_version",
+                "$app_version",
+            ])
+            let groups = event.properties["$groups"] as? [String: String]
+            expect(groups?["some-type"]) == "some-key"
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sends full feature flag event when gated but flag has an experiment") {
+            server.minimalFlagCalledEvents = true
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("bool-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == true
+            expect(event.properties["$feature/bool-value"] as? Bool) == true
+            expect(event.properties["$active_feature_flags"]).toNot(beNil())
+            expect(event.properties["$is_identified"]).toNot(beNil())
+            expect(event.properties["$recording_status"]).toNot(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sends full feature flag event when gated but has_experiment is unknown") {
+            server.minimalFlagCalledEvents = true
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("number-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag_has_experiment"]).to(beNil())
+            expect(event.properties["$active_feature_flags"]).toNot(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sends full feature flag event when the server does not gate minimal events") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("string-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == false
+            expect(event.properties["$feature/string-value"] as? String) == "test"
+            expect(event.properties["$active_feature_flags"]).toNot(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("send feature flag event for getFeatureFlag when enabled") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.getFeatureFlag("bool-value") as? Bool) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag"] as? String) == "bool-value"
+            expect(event.properties["$feature_flag_response"] as? Bool) == true
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("force send feature flag event for getFeatureFlag when config disabled") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: false)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.getFeatureFlag("bool-value", sendFeatureFlagEvent: true) as? Bool) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag"] as? String) == "bool-value"
+            expect(event.properties["$feature_flag_response"] as? Bool) == true
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("don't send feature flag event for getFeatureFlag when config enabled") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.getFeatureFlag("bool-value", sendFeatureFlagEvent: false) as? Bool) == true
+
+            let events = getBatchedEvents(server, failIfNotCompleted: false)
+
+            expect(events.count) == 0
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("reloadFeatureFlags adds groups if any") {
+            let sut = self.getSut()
+            // group reloads flags when there are new groups
+            // but in this case we want to reload manually and assert the response
+            sut.remoteConfig?.canReloadFlagsForTesting = false
+            sut.group(type: "some-type", key: "some-key", groupProperties: [
+                "name": "some-company-name",
+            ])
+            sut.remoteConfig?.canReloadFlagsForTesting = true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            sut.reloadFeatureFlags()
+
+            let requests = getFlagsRequest(server)
+
+            expect(requests.count) == 1
+            let request = requests.first
+
+            let groups = request!["groups"] as? [String: String] ?? [:]
+            expect(groups["some-type"]) == "some-key"
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("merge groups when group is called") {
+            let sut = self.getSut(flushAt: 3)
+
+            sut.group(type: "some-type", key: "some-key")
+
+            sut.group(type: "some-type-2", key: "some-key-2")
+
+            sut.capture("event")
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 3
+            let event = events.last!
+
+            let groups = event.properties["$groups"] as? [String: String]
+            expect(groups!["some-type"]) == "some-key"
+            expect(groups!["some-type-2"]) == "some-key-2"
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("register and unregister properties") {
+            let sut = self.getSut(flushAt: 1)
+
+            sut.register(["test1": "test"])
+            sut.register(["test2": "test"])
+            sut.unregister("test2")
+            sut.register(["test3": "test"])
+
+            sut.capture("event")
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+            let event = events.last!
+
+            expect(event.properties["test1"] as? String) == "test"
+            expect(event.properties["test3"] as? String) == "test"
+            expect(event.properties["test2"] as? String) == nil
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("add active feature flags as part of the event") {
+            let sut = self.getSut()
+
+            sut.reloadFeatureFlags()
+            waitForFeatureFlagsLoaded(server, sut)
+
+            sut.capture("event")
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+            let event = events.first!
+
+            let activeFlags = event.properties["$active_feature_flags"] as? [Any] ?? []
+            expect(activeFlags.contains { $0 as? String == "bool-value" }) == true
+            expect(activeFlags.contains { $0 as? String == "disabled-flag" }) == false
+
+            expect(event.properties["$feature/bool-value"] as? Bool) == true
+            expect(event.properties["$feature/disabled-flag"] as? Bool) == false
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("caller-supplied feature flag properties override cached values") {
+            let sut = self.getSut()
+
+            sut.reloadFeatureFlags()
+            waitForFeatureFlagsLoaded(server, sut)
+
+            sut.capture("event", properties: [
+                "$feature/bool-value": "server-value",
+                "$active_feature_flags": ["server-flag"],
+            ])
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+            let event = events.first!
+
+            expect(event.properties["$feature/bool-value"] as? String) == "server-value"
+            let activeFlags = event.properties["$active_feature_flags"] as? [Any] ?? []
+            expect(activeFlags.count) == 1
+            expect(activeFlags.first as? String) == "server-flag"
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sanitize properties") {
+            let sut = self.getSut(flushAt: 1)
+
+            sut.register(["boolIsOk": true,
+                          "test5": UserDefaults.standard])
+
+            sut.capture("test event",
+                        properties: ["foo": "bar",
+                                     "test1": UserDefaults.standard,
+                                     "arrayIsOk": [1, 2, 3],
+                                     "dictIsOk": ["1": "one"]],
+                        userProperties: ["userProp": "value",
+                                         "test2": UserDefaults.standard],
+                        userPropertiesSetOnce: ["userPropOnce": "value",
+                                                "test3": UserDefaults.standard])
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+            let event = events.first!
+
+            expect(event.properties["test1"]) == nil
+            expect(event.properties["test2"]) == nil
+            expect(event.properties["test3"]) == nil
+            expect(event.properties["test4"]) == nil
+            expect(event.properties["test5"]) == nil
+            expect(event.properties["arrayIsOk"]) != nil
+            expect(event.properties["dictIsOk"]) != nil
+            expect(event.properties["boolIsOk"]) != nil
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sets sessionId on app start") {
+            let sut = self.getSut(captureApplicationLifecycleEvents: true, flushAt: 1)
+
+            mockAppLifecycle.simulateAppDidFinishLaunching()
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.properties["$session_id"]).toNot(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("uses the same sessionId for all events in a session") {
+            let sut = self.getSut(flushAt: 3)
+            let mockNow = MockDate()
+            now = { mockNow.date }
+
+            sut.capture("event1")
+
+            mockNow.date.addTimeInterval(10)
+
+            sut.capture("event2")
+
+            mockNow.date.addTimeInterval(10)
+
+            sut.capture("event3")
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 3
+
+            let sessionId = events[0].properties["$session_id"] as? String
+            expect(sessionId).toNot(beNil())
+            expect(events[1].properties["$session_id"] as? String).to(equal(sessionId))
+            expect(events[2].properties["$session_id"] as? String).to(equal(sessionId))
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("clears sessionId for background events after 30 mins in background") {
+            let sut = self.getSut(captureApplicationLifecycleEvents: false, flushAt: 2)
+            let mockNow = MockDate()
+            now = { mockNow.date }
+
+            sut.capture("event captured in foreground")
+
+            mockAppLifecycle.simulateAppDidEnterBackground()
+
+            mockNow.date.addTimeInterval(60 * 30 + 1) // Background "timer": 30 mins 1 second
+
+            sut.capture("event captured while in background")
+
+            let events = getBatchedEvents(server)
+            expect(events.count) == 2
+
+            expect(events[0].properties["$session_id"] as? String).toNot(beNil())
+            expect(events[1].properties["$session_id"] as? String).to(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("reset sessionId after reset") {
+            let sut = self.getSut(captureApplicationLifecycleEvents: false, flushAt: 1)
+            let mockNow = MockDate()
+            now = { mockNow.date }
+
+            sut.capture("event captured with session")
+
+            var events = getBatchedEvents(server)
+            expect(events.count) == 1
+
+            let currentSessionId = events[0].properties["$session_id"] as? String
+            expect(currentSessionId).toNot(beNil())
+
+            sut.reset()
+
+            server.stop()
+            server = nil
+            server = MockTxlemetryServer()
+            server.start()
+
+            sut.capture("event captured w/o session")
+
+            events = getBatchedEvents(server)
+            expect(events.count) == 1
+
+            let newSessionId = events[0].properties["$session_id"] as? String
+            expect(newSessionId).toNot(beNil())
+
+            expect(currentSessionId).toNot(equal(newSessionId))
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("reset deletes posthog files but not other folders") {
+            let appFolder = applicationSupportDirectoryURL()
+            // Ensure clean state - previous async operations may have recreated the directory
+            deleteSafely(appFolder)
+
+            let sut = self.getSut()
+
+            sut.reset()
+            sut.close()
+
+            expect(FileManager.default.fileExists(atPath: appFolder.path)) == true
+        }
+
+        it("client sanitize properties") {
+            let sanitizer = ExampleSanitizer()
+            let sut = self.getSut(propertiesSanitizer: sanitizer)
+
+            let props: [String: Any] = ["empty": ""]
+
+            sut.capture("event", properties: props)
+
+            let events = getBatchedEvents(server)
+
+            expect(events[0].properties["empty"] as? String).to(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("reset reloads flags as anon user") {
+            let sut = self.getSut()
+
+            sut.reset()
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("bool-value")) == true
+
+            sut.close()
+        }
+
+        it("captures an event with a custom timestamp as the equivalent UTC instant") {
+            let sut = self.getSut()
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: 5 * 60 * 60 + 30 * 60)!
+            let eventDate = calendar.date(from: DateComponents(
+                year: 2024,
+                month: 12,
+                day: 17,
+                hour: 22,
+                minute: 21,
+                second: 6,
+                nanosecond: 952_000_000
+            ))!
+
+            sut.capture("test event",
+                        properties: ["foo": "bar"],
+                        userProperties: ["userProp": "value"],
+                        userPropertiesSetOnce: ["userPropOnce": "value"],
+                        groups: ["groupProp": "value"],
+                        timestamp: eventDate)
+
+            let events = getBatchedEvents(server)
+            expect(events.count) == 1
+
+            let requestBody = server.parseRequest(server.batchRequests.first!)
+            let event = (requestBody?["batch"] as? [[String: Any]])?.first
+
+            expect(event?["event"] as? String) == "test event"
+            expect(event?["timestamp"] as? String) == "2024-12-17T16:51:06.952Z"
+
+            let properties = event?["properties"] as? [String: Any] ?? [:]
+            expect(properties["foo"] as? String) == "bar"
+
+            let set = properties["$set"] as? [String: Any] ?? [:]
+            expect(set["userProp"] as? String) == "value"
+
+            let setOnce = properties["$set_once"] as? [String: Any] ?? [:]
+            expect(setOnce["userPropOnce"] as? String) == "value"
+
+            let groupProps = properties["$groups"] as? [String: String] ?? [:]
+            expect(groupProps["groupProp"]) == "value"
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("captures $feature_flag_called when getFeatureFlag is called") {
+            let sut = self.getSut(
+                sendFeatureFlagEvent: true,
+                flushAt: 1
+            )
+
+            _ = sut.getFeatureFlag("some_key")
+
+            let event = getBatchedEvents(server)
+            expect(event.first!.event).to(equal("$feature_flag_called"))
+            // v3 responses carry no flag details, so has_experiment is unknown and omitted
+            expect(event.first!.properties["$feature_flag_has_experiment"]).to(beNil())
+        }
+
+        it("does not capture $feature_flag_called when getFeatureFlag is called twice") {
+            let sut = self.getSut(
+                sendFeatureFlagEvent: true,
+                flushAt: 2
+            )
+
+            _ = sut.getFeatureFlag("some_key")
+            _ = sut.getFeatureFlag("some_key")
+            sut.capture("force_batch_flush")
+
+            let event = getBatchedEvents(server)
+            expect(event.count).to(equal(2))
+            expect(event[0].event).to(equal("$feature_flag_called"))
+            expect(event[1].event).to(equal("force_batch_flush"))
+        }
+
+        it("does not capture $feature_flag_called again when getFeatureFlag called twice after reloading flags") {
+            let sut = self.getSut(
+                sendFeatureFlagEvent: true,
+                flushAt: 2
+            )
+
+            _ = sut.getFeatureFlag("some_key")
+
+            sut.reloadFeatureFlags {
+                _ = sut.getFeatureFlag("some_key")
+            }
+            sut.capture("force_batch_flush")
+
+            let event = getBatchedEvents(server)
+            expect(event.count).to(equal(2))
+            expect(event[0].event).to(equal("$feature_flag_called"))
+            expect(event[1].event).to(equal("force_batch_flush"))
+        }
+
+        it("captures $feature_flag_called again when getFeatureFlag returns different value after reloading flags") {
+            let sut = self.getSut(
+                sendFeatureFlagEvent: true,
+                flushAt: 3
+            )
+
+            // First call gets a false value
+            _ = sut.getFeatureFlag("disabled-flag")
+
+            // Change the mock server to return a different value for the same key
+            server.disabledFlag = true
+
+            sut.reloadFeatureFlags {
+                // Second call gets a true value
+                _ = sut.getFeatureFlag("disabled-flag")
+                sut.capture("force_batch_flush")
+            }
+
+            waitFlagsRequest(server)
+
+            let events = getBatchedEvents(server)
+            expect(events.count).to(equal(3))
+
+            expect(events[0].event).to(equal("$feature_flag_called"))
+            expect(events[1].event).to(equal("$feature_flag_called"))
+            expect(events[2].event).to(equal("force_batch_flush"))
+        }
+
+        describe("beforeSend hook") {
+            let eventTriggers = getBeforeSendEventsConfig()
+            let testOtherEventKey = "other_event"
+            var sut: TxlemetrySDK!
+
+            afterEach {
+                sut?.reset()
+                sut?.close()
+            }
+
+            for eventTrigger in eventTriggers {
+                context("returns nil") {
+                    beforeEach {
+                        sut = self.getSut(
+                            sendFeatureFlagEvent: true,
+                            flushAt: 1,
+                            beforeSend: [{
+                                $0.event == eventTrigger.targetKey ? nil : $0
+                            }]
+                        )
+                    }
+
+                    describe(eventTrigger.testName) {
+                        it("skips the event") {
+                            sut.capture(testOtherEventKey)
+                            eventTrigger.triggerClosure(sut)
+
+                            let events = getBatchedEvents(server)
+                            let eventNames = events.map(\.event)
+
+                            expect(events.count).to(equal(1))
+                            expect(eventNames).notTo(contain(eventTrigger.targetKey))
+                        }
+
+                        it("preserves other events") {
+                            sut.capture(testOtherEventKey)
+                            eventTrigger.triggerClosure(sut)
+
+                            let event = getBatchedEvents(server)
+
+                            expect(event.count).to(equal(1))
+                            expect(event[0].event).to(equal(testOtherEventKey))
+                        }
+                    }
+                }
+
+                context("event is updated") {
+                    let testUpdatedEventKey = "updated_event"
+
+                    beforeEach {
+                        sut = self.getSut(
+                            sendFeatureFlagEvent: true,
+                            flushAt: 2,
+                            beforeSend: [{
+                                if $0.event == eventTrigger.targetKey {
+                                    $0.event = testUpdatedEventKey
+                                }
+
+                                return $0
+                            }]
+                        )
+                    }
+
+                    describe(eventTrigger.testName) {
+                        it("updates the event") {
+                            sut.capture(testOtherEventKey)
+                            eventTrigger.triggerClosure(sut)
+
+                            let events = getBatchedEvents(server)
+                            let eventNames = events.map(\.event)
+
+                            expect(events.count).to(equal(2))
+                            expect(eventNames).to(contain(testUpdatedEventKey))
+                        }
+
+                        it("preserves all events") {
+                            sut.capture(testOtherEventKey)
+                            eventTrigger.triggerClosure(sut)
+
+                            let event = getBatchedEvents(server)
+
+                            expect(event.count).to(equal(2))
+                            expect(event[0].event).to(equal(testOtherEventKey))
+                        }
+                    }
+                }
+
+                context("default hook") {
+                    beforeEach {
+                        sut = self.getSut(
+                            sendFeatureFlagEvent: true,
+                            flushAt: 2
+                        )
+                    }
+
+                    describe(eventTrigger.testName) {
+                        it("keeps the events intact") {
+                            sut.capture(testOtherEventKey)
+                            eventTrigger.triggerClosure(sut)
+
+                            let events = getBatchedEvents(server)
+                            let eventNames = events.map(\.event)
+
+                            expect(events.count).to(equal(2))
+                            expect(eventNames[0]).to(equal(testOtherEventKey))
+                            expect(eventNames[1]).to(equal(eventTrigger.targetKey))
+                        }
+                    }
+                }
+            }
+
+            it("skip updated to $session event") {
+                let testKey = "test_key"
+                sut = self.getSut(
+                    sendFeatureFlagEvent: true,
+                    flushAt: 1,
+                    beforeSend: [{
+                        if $0.event == testKey {
+                            $0.event = "$snapshot"
+                        }
+                        return $0
+                    }]
+                )
+
+                sut.capture(testKey)
+                sut.capture("other_test")
+
+                let events = getBatchedEvents(server)
+                expect(events.count).to(equal(1))
+                expect(events[0].event).to(equal("other_test"))
+            }
+
+            it("runs boxed Objective-C callbacks through the exception boundary") {
+                sut = self.getSut(flushAt: 1)
+                let boxes: [NSObject] = [
+                    BoxedBeforeSendBlock { event in
+                        event.event = "boxed_modified_event"
+                        return event
+                    },
+                ]
+                PHBeforeSendExceptionTestFixture.setBeforeSend(boxes, on: sut.config)
+
+                sut.capture("original_event")
+
+                let events = getBatchedEvents(server)
+                expect(events.count).to(equal(1))
+                expect(events[0].event).to(equal("boxed_modified_event"))
+            }
+
+            it("contains Objective-C exceptions from boxed callbacks") {
+                sut = self.getSut(flushAt: 1)
+                var laterCallbackInvoked = false
+                let throwingBox = PHBeforeSendExceptionTestFixture.makeThrowingBox(BoxedBeforeSendBlock.self)
+                let boxes: [NSObject] = [
+                    throwingBox,
+                    BoxedBeforeSendBlock { event in
+                        laterCallbackInvoked = true
+                        return event
+                    },
+                ]
+                PHBeforeSendExceptionTestFixture.setBeforeSend(boxes, on: sut.config)
+
+                let returnedNormally = PHBeforeSendExceptionTestFixture.invokeWithoutException {
+                    sut.capture("objc_exception_event")
+                }
+                sut.flush()
+
+                guard let storage = sut.storage else {
+                    fail("Expected analytics storage to be configured")
+                    return
+                }
+                let persistedQueue = TxlemetryFileBackedQueue(queue: storage.url(forKey: .queue))
+                expect(returnedNormally).to(beTrue())
+                expect(laterCallbackInvoked).to(beFalse())
+                expect(persistedQueue.depth).to(equal(0))
+                expect(server.batchRequests).to(beEmpty())
+            }
+
+            describe("array edge cases") {
+                it("properly handles empty beforeSend array") {
+                    sut = self.getSut(
+                        sendFeatureFlagEvent: true,
+                        flushAt: 2,
+                        beforeSend: []
+                    )
+
+                    let expectedEvents = [
+                        "first_event",
+                        "second_event",
+                    ]
+
+                    for event in expectedEvents {
+                        sut.capture(event)
+                    }
+
+                    let events = getBatchedEvents(server)
+                    expect(events.count).to(equal(expectedEvents.count))
+                    expect(events.map(\.event)).to(equal(expectedEvents))
+                }
+
+                it("supports trailing closure syntax for single block") {
+                    let sut = self.getSut(
+                        sendFeatureFlagEvent: true,
+                        flushAt: 1
+                    )
+
+                    sut.config.setBeforeSend { $0.event == "first_event" ? nil : $0 }
+
+                    sut.capture("first_event")
+                    sut.capture("second_event")
+
+                    let events = getBatchedEvents(server)
+                    expect(events.count).to(equal(1))
+                    expect(events[0].event).to(equal("second_event"))
+                }
+
+                it("supports multiple beforeSend blocks") {
+                    let sut = self.getSut(
+                        sendFeatureFlagEvent: true,
+                        flushAt: 2,
+                        beforeSend: [
+                            { $0.event == "first_event" ? nil : $0 },
+                            { $0.event = "modified_event"
+                                return $0 },
+                            { $0.event == "second_event" ? nil : $0 },
+                        ]
+                    )
+
+                    sut.capture("first_event")
+                    sut.capture("second_event")
+                    sut.capture("third_event")
+
+                    // first event is skipped by the first block
+                    // second event is modified by the second block and not skipped by the third block(because it became "modified_event")
+                    // third event is modified by the second block
+                    let expectedEvents = [
+                        "modified_event",
+                        "modified_event",
+                    ]
+
+                    let events = getBatchedEvents(server)
+                    expect(events.count).to(equal(expectedEvents.count))
+                    expect(events.map(\.event)).to(equal(expectedEvents))
+                }
+            }
+        }
+
+        context("automatic person properties") {
+            it("sets default person properties on SDK setup when enabled") {
+                let sut = self.getSut(preloadFeatureFlags: true)
+
+                let requests = getFlagsRequest(server)
+                expect(requests.count).to(beGreaterThan(0))
+
+                guard let lastRequest = requests.last else {
+                    fail("No flags request found")
+                    return
+                }
+
+                guard let personProperties = lastRequest["person_properties"] as? [String: Any] else {
+                    fail("Person properties not found in request")
+                    return
+                }
+
+                // Verify expected default properties are set
+                expect(personProperties["$app_version"]).toNot(beNil())
+                expect(personProperties["$app_build"]).toNot(beNil())
+                expect(personProperties["$app_namespace"]).toNot(beNil())
+                expect(personProperties["$os_name"]).toNot(beNil())
+                expect(personProperties["$os_version"]).toNot(beNil())
+                expect(personProperties["$device_type"]).toNot(beNil())
+                expect(personProperties["$lib"]).toNot(beNil())
+                expect(personProperties["$lib_version"]).toNot(beNil())
+            }
+
+            it("does not set default person properties when disabled") {
+                let sut = self.getSut(setDefaultPersonProperties: false)
+
+                // Manually trigger a flag request since no automatic one will happen
+                sut.reloadFeatureFlags()
+
+                let requests = getFlagsRequest(server)
+                expect(requests.count).to(beGreaterThan(0))
+
+                guard let lastRequest = requests.last else {
+                    fail("No flags request found")
+                    return
+                }
+
+                // person_properties should be nil when default properties are disabled
+                expect(lastRequest["person_properties"]).to(beNil())
+            }
+        }
+
+        #if os(iOS)
+            context("autocapture") {
+                it("isAutocaptureActive() should be false if disabled by config") {
+                    let config = TxlemetryConfig(projectToken: testProjectToken)
+                    config.captureElementInteractions = false
+                    let sut = TxlemetrySDK.with(config)
+
+                    expect(sut.isAutocaptureActive()).to(beFalse())
+                }
+
+                it("isAutocaptureActive() should be false if SDK is not enabled") {
+                    let config = TxlemetryConfig(projectToken: testProjectToken)
+                    config.captureElementInteractions = true
+                    let sut = TxlemetrySDK.with(config)
+                    sut.close()
+                    expect(sut.isAutocaptureActive()).to(beFalse())
+                }
+            }
+        #endif
+    }
+}
+
+struct BeforeSendTestEventContext {
+    let triggerClosure: (TxlemetrySDK) -> Void
+    let targetKey: String
+    let testName: String
+}

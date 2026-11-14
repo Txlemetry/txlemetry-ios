@@ -1,0 +1,4 @@
+Txlemetry ios SDK
+Derived from https://github.com/PostHog/posthog-ios at e751c190562878700599243971a04fae17798480, tag 3.84.0.
+Original copyright and license notices are retained.
+Changes: Txlemetry API, package identities, default hosts, distribution and compatibility with native wrappers.

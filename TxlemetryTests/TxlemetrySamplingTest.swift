@@ -1,0 +1,370 @@
+import Foundation
+@testable import Txlemetry
+import Testing
+
+@Suite("Session Replay Sampling Tests")
+class TxlemetrySamplingTests {
+    // MARK: - simpleHash Tests
+
+    @Test("simpleHash produces consistent values for the same input")
+    func simpleHashConsistent() {
+        let hash1 = simpleHash("test-session-id")
+        let hash2 = simpleHash("test-session-id")
+        #expect(hash1 == hash2)
+    }
+
+    @Test("simpleHash produces positive values")
+    func simpleHashPositive() {
+        let inputs = [
+            "session-1",
+            "session-2",
+            "abc123",
+            "00000000-0000-0000-0000-000000000000",
+            UUID().uuidString,
+        ]
+        for input in inputs {
+            #expect(simpleHash(input) >= 0, "Hash for '\(input)' should be non-negative")
+        }
+    }
+
+    @Test("simpleHash produces distinct values for different inputs")
+    func simpleHashDistinct() {
+        let hash1 = simpleHash("session-1")
+        let hash2 = simpleHash("session-2")
+        #expect(hash1 != hash2)
+    }
+
+    @Test("simpleHash handles empty string")
+    func simpleHashEmpty() {
+        let hash = simpleHash("")
+        #expect(hash == 0)
+    }
+
+    // MARK: - sampleOnProperty Tests
+
+    @Test("sampleOnProperty returns true at rate 1.0")
+    func sampleOnPropertyFullRate() {
+        // At rate 1.0, all sessions should be sampled in
+        for i in 0 ..< 100 {
+            #expect(sampleOnProperty("session-\(i)", 1.0) == true)
+        }
+    }
+
+    @Test("sampleOnProperty returns false at rate 0.0")
+    func sampleOnPropertyZeroRate() {
+        // At rate 0.0, no sessions should be sampled in
+        for i in 0 ..< 100 {
+            #expect(sampleOnProperty("session-\(i)", 0.0) == false)
+        }
+    }
+
+    @Test("sampleOnProperty is deterministic")
+    func sampleOnPropertyDeterministic() {
+        let sessionId = "test-session-id-12345"
+        let rate = 0.5
+        let result1 = sampleOnProperty(sessionId, rate)
+        let result2 = sampleOnProperty(sessionId, rate)
+        #expect(result1 == result2)
+    }
+
+    @Test("sampleOnProperty clamps rate above 1.0")
+    func sampleOnPropertyClampsAboveOne() {
+        // Rate > 1.0 should be clamped to 1.0 (record all)
+        for i in 0 ..< 100 {
+            #expect(sampleOnProperty("session-\(i)", 1.5) == true)
+        }
+    }
+
+    @Test("sampleOnProperty clamps rate below 0.0")
+    func sampleOnPropertyClampsBelowZero() {
+        // Rate < 0.0 should be clamped to 0.0 (record none)
+        for i in 0 ..< 100 {
+            #expect(sampleOnProperty("session-\(i)", -0.5) == false)
+        }
+    }
+
+    @Test("sampleOnProperty samples approximately correct percentage")
+    func sampleOnPropertyApproximateRate() {
+        // With enough samples, ~50% should be sampled in at rate 0.5
+        var sampledIn = 0
+        let total = 1000
+        for i in 0 ..< total {
+            if sampleOnProperty("session-\(i)", 0.5) {
+                sampledIn += 1
+            }
+        }
+        // Allow generous tolerance since hash distribution may not be perfectly uniform
+        let ratio = Double(sampledIn) / Double(total)
+        #expect(ratio > 0.3, "Expected roughly 50% sampled in, got \(ratio * 100)%")
+        #expect(ratio < 0.7, "Expected roughly 50% sampled in, got \(ratio * 100)%")
+    }
+}
+
+#if os(iOS)
+
+    // MARK: - parseSampleRate Tests
+
+    @Suite("parseSampleRate Tests", .serialized)
+    class ParseSampleRateTests {
+        let config = TxlemetryConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+        var server: MockTxlemetryServer!
+
+        init() {
+            server = MockTxlemetryServer()
+            server.start()
+            let storage = TxlemetryStorage(config)
+            storage.reset()
+            // reset() keeps .remoteConfig (project-level config); clear it so shared on-disk storage
+            // doesn't leak recording config between these serialized tests.
+            storage.remove(key: .remoteConfig)
+        }
+
+        deinit {
+            server.stop()
+            server = nil
+        }
+
+        func getSut(
+            storage: TxlemetryStorage? = nil,
+            config: TxlemetryConfig? = nil
+        ) -> TxlemetryRemoteConfig {
+            let theConfig = config ?? self.config
+            let theStorage = storage ?? TxlemetryStorage(theConfig)
+            let api = TxlemetryApi(theConfig)
+            return TxlemetryRemoteConfig(theConfig, theStorage, api) { [:] }
+        }
+
+        @Test("getRecordingSampleRate returns nil when no sample rate is configured")
+        func noSampleRateConfigured() {
+            let sut = getSut()
+            #expect(sut.getRecordingSampleRate() == nil)
+        }
+
+        @Test("preloads sample rate from cache as string")
+        func preloadsSampleRateFromCacheAsString() {
+            let storage = TxlemetryStorage(config)
+            defer { storage.reset() }
+
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "0.75"]])
+
+            let sut = getSut(storage: storage)
+
+            #expect(sut.getRecordingSampleRate() == 0.75)
+        }
+
+        @Test("preloads sample rate from cache as number")
+        func preloadsSampleRateFromCacheAsNumber() {
+            let storage = TxlemetryStorage(config)
+            defer { storage.reset() }
+
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": 0.5]])
+
+            let sut = getSut(storage: storage)
+
+            #expect(sut.getRecordingSampleRate() == 0.5)
+        }
+
+        @Test("preloads sample rate 1.0 from cache")
+        func preloadsSampleRateOneFromCache() {
+            let storage = TxlemetryStorage(config)
+            defer { storage.reset() }
+
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "1"]])
+
+            let sut = getSut(storage: storage)
+
+            #expect(sut.getRecordingSampleRate() == 1.0)
+        }
+
+        @Test("preloads sample rate 0.0 from cache")
+        func preloadsSampleRateZeroFromCache() {
+            let storage = TxlemetryStorage(config)
+            defer { storage.reset() }
+
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "0"]])
+
+            let sut = getSut(storage: storage)
+
+            #expect(sut.getRecordingSampleRate() == 0.0)
+        }
+
+        @Test("ignores invalid sample rate above 1.0 from cache")
+        func ignoresInvalidSampleRateAboveOneFromCache() {
+            let storage = TxlemetryStorage(config)
+            defer { storage.reset() }
+
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "1.5"]])
+
+            let sut = getSut(storage: storage)
+
+            #expect(sut.getRecordingSampleRate() == nil)
+        }
+
+        @Test("ignores negative sample rate from cache")
+        func ignoresNegativeSampleRateFromCache() {
+            let storage = TxlemetryStorage(config)
+            defer { storage.reset() }
+
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "-0.5"]])
+
+            let sut = getSut(storage: storage)
+
+            #expect(sut.getRecordingSampleRate() == nil)
+        }
+
+        @Test("ignores non-numeric sample rate from cache")
+        func ignoresNonNumericSampleRateFromCache() {
+            let storage = TxlemetryStorage(config)
+            defer { storage.reset() }
+
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "invalid"]])
+
+            let sut = getSut(storage: storage)
+
+            #expect(sut.getRecordingSampleRate() == nil)
+        }
+
+        @Test("parses sample rate from remote config response")
+        func parsesSampleRateFromRemoteConfig() async {
+            let config = TxlemetryConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+            config.remoteConfig = true
+            config.preloadFeatureFlags = false
+            config.storageManager = TxlemetryStorageManager(config)
+
+            server.returnReplay = true
+            server.sessionRecordingSampleRate = "0.5"
+
+            let sut = getSut(config: config)
+
+            let remoteConfigLoaded = AsyncLatch()
+            let token = sut.onRemoteConfigLoaded.subscribe { _ in
+                remoteConfigLoaded.signal()
+            }
+
+            await remoteConfigLoaded.wait()
+
+            #expect(sut.getRecordingSampleRate() == 0.5)
+            _ = token
+        }
+
+        @Test("remote config without sample rate leaves it nil")
+        func remoteConfigWithoutSampleRate() async {
+            let config = TxlemetryConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+            config.remoteConfig = true
+            config.preloadFeatureFlags = false
+            config.storageManager = TxlemetryStorageManager(config)
+
+            server.returnReplay = true
+            // no sessionRecordingSampleRate set
+
+            let sut = getSut(config: config)
+
+            let remoteConfigLoaded = AsyncLatch()
+            let token = sut.onRemoteConfigLoaded.subscribe { _ in
+                remoteConfigLoaded.signal()
+            }
+
+            await remoteConfigLoaded.wait()
+
+            #expect(sut.getRecordingSampleRate() == nil)
+            _ = token
+        }
+    }
+
+    // MARK: - Replay integration remote sample rate Tests
+
+    @Suite("Replay integration remote sample rate Tests", .serialized)
+    class ReplayIntegrationRemoteSampleRateTests {
+        let server: MockTxlemetryServer
+
+        init() {
+            server = MockTxlemetryServer()
+            server.start()
+            TxlemetryReplayIntegration.clearInstalls()
+        }
+
+        deinit {
+            server.stop()
+            TxlemetryReplayIntegration.clearInstalls()
+        }
+
+        @Test("remote sample rate is applied after config loads")
+        func remoteSampleRateIsAppliedAfterConfigLoads() async {
+            let config = TxlemetryConfig(projectToken: "remote_sample_rate_test", host: "http://localhost:9001")
+            config.sessionReplay = true
+            config.preloadFeatureFlags = false
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+            config.storageManager = TxlemetryStorageManager(config)
+
+            let storage = TxlemetryStorage(config)
+            storage.reset()
+            storage.remove(key: .remoteConfig)
+
+            server.returnReplay = true
+            server.sessionRecordingSampleRate = "0"
+
+            let sut = TxlemetrySDK.with(config)
+            defer { sut.close() }
+
+            await waitUntil {
+                sut.remoteConfig?.getRecordingSampleRate() == 0.0
+            }
+
+            await waitUntil {
+                sut.getReplayIntegration()?.isActive() == false
+            }
+
+            #expect(sut.remoteConfig?.getRecordingSampleRate() == 0.0)
+            #expect(sut.getReplayIntegration()?.isActive() == false)
+            #expect(sut.isSessionReplayActive() == false)
+        }
+    }
+
+    // MARK: - TxlemetrySessionReplayConfig sampleRate Tests
+
+    @Suite("TxlemetrySessionReplayConfig sampleRate Tests")
+    class SessionReplayConfigSampleRateTests {
+        @Test("sampleRate defaults to nil")
+        func sampleRateDefaultsToNil() {
+            let config = TxlemetrySessionReplayConfig()
+            #expect(config.sampleRate == nil)
+        }
+
+        @Test("sampleRate accepts valid value")
+        func sampleRateAcceptsValidValue() {
+            let config = TxlemetrySessionReplayConfig()
+            config.sampleRate = NSNumber(value: 0.5)
+            #expect(config.sampleRate?.doubleValue == 0.5)
+        }
+
+        @Test("sampleRate accepts 0.0")
+        func sampleRateAcceptsZero() {
+            let config = TxlemetrySessionReplayConfig()
+            config.sampleRate = NSNumber(value: 0.0)
+            #expect(config.sampleRate?.doubleValue == 0.0)
+        }
+
+        @Test("sampleRate accepts 1.0")
+        func sampleRateAcceptsOne() {
+            let config = TxlemetrySessionReplayConfig()
+            config.sampleRate = NSNumber(value: 1.0)
+            #expect(config.sampleRate?.doubleValue == 1.0)
+        }
+
+        @Test("sampleRate rejects value above 1.0")
+        func sampleRateRejectsAboveOne() {
+            let config = TxlemetrySessionReplayConfig()
+            config.sampleRate = NSNumber(value: 1.5)
+            #expect(config.sampleRate == nil)
+        }
+
+        @Test("sampleRate rejects negative value")
+        func sampleRateRejectsNegative() {
+            let config = TxlemetrySessionReplayConfig()
+            config.sampleRate = NSNumber(value: -0.5)
+            #expect(config.sampleRate == nil)
+        }
+    }
+#endif

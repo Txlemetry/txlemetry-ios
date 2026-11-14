@@ -1,0 +1,257 @@
+#if os(iOS)
+    import Foundation
+    @testable import Txlemetry
+    import Testing
+
+    @Suite("Session Replay Event Triggers", .serialized)
+    class TxlemetrySessionReplayEventTriggersTests {
+        let testProjectToken = "test_project_token"
+        let server: MockTxlemetryServer
+
+        init() {
+            server = MockTxlemetryServer()
+            server.start()
+        }
+
+        deinit {
+            server.stop()
+        }
+
+        private func getSut(
+            eventTriggers: [String]? = nil,
+            linkedFlagNotMatched: Bool = false
+        ) -> TxlemetrySDK {
+            let config = TxlemetryConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+            config.sessionReplay = true
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.preloadFeatureFlags = false
+            // Drive recording config from the seeded .remoteConfig below, not the async /config fetch,
+            // so the tests stay deterministic and independent of global stub state from other suites.
+            config.disableRemoteConfigForTesting = true
+
+            // Configure mock server for remote config
+            server.returnReplay = true
+            server.sessionRecordingEventTriggers = eventTriggers
+
+            // Seed the recording config so install() reads the event triggers up front (.remoteConfig
+            // survives reset(), so clear any value leaked from a previous serialized test first).
+            let storage = TxlemetryStorage(config)
+            storage.remove(key: .remoteConfig)
+            var sessionRecording: [String: Any] = ["endpoint": "/s/"]
+            if let eventTriggers {
+                sessionRecording["eventTriggers"] = eventTriggers
+            }
+            if linkedFlagNotMatched {
+                // No cached value seeded for this flag, so it evaluates as not matched.
+                sessionRecording["linkedFlag"] = "unmatched_replay_flag"
+            }
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": sessionRecording])
+
+            // Reset the static install flag a prior replay suite may have left set, so this SUT installs
+            // a fresh integration rather than no-opping onto a stale one.
+            TxlemetryReplayIntegration.clearInstalls()
+
+            return TxlemetrySDK.with(config)
+        }
+
+        // MARK: - isActive() Tests
+
+        @Test("isActive returns true when no event triggers configured")
+        func isActiveWithoutTriggers() async throws {
+            let sut = getSut(eventTriggers: nil)
+            let integration = sut.getReplayIntegration()
+            #expect(integration != nil)
+            #expect(integration?.isActive() == true)
+
+            sut.close()
+        }
+
+        @Test("isActive returns false when waiting for event trigger")
+        func isActiveWhileWaitingForTrigger() async throws {
+            let sut = getSut(eventTriggers: ["purchase_completed"])
+            let integration = sut.getReplayIntegration()
+            #expect(integration != nil)
+            #expect(integration?.isActive() == false)
+
+            sut.close()
+        }
+
+        @Test("isActive returns true after trigger event is captured")
+        func isActiveAfterTriggerFired() async throws {
+            let sut = getSut(eventTriggers: ["purchase_completed"])
+            let integration = sut.getReplayIntegration()
+            #expect(integration != nil)
+            #expect(integration?.isActive() == false)
+
+            sut.capture("purchase_completed")
+
+            #expect(integration?.isActive() == true)
+
+            sut.close()
+        }
+
+        // MARK: - Trigger Matching Tests
+
+        @Test("Non-matching event does not activate replay")
+        func nonMatchingEventDoesNotActivate() async throws {
+            let sut = getSut(eventTriggers: ["purchase_completed"])
+            let integration = sut.getReplayIntegration()
+            #expect(integration?.isActive() == false)
+
+            sut.capture("page_view")
+            sut.capture("button_clicked")
+
+            #expect(integration?.isActive() == false)
+
+            sut.close()
+        }
+
+        @Test("Any matching trigger activates replay")
+        func anyMatchingTriggerActivates() async throws {
+            let sut = getSut(eventTriggers: ["purchase_completed", "signup_finished", "checkout_started"])
+            let integration = sut.getReplayIntegration()
+            #expect(integration?.isActive() == false)
+
+            sut.capture("signup_finished")
+
+            #expect(integration?.isActive() == true)
+
+            sut.close()
+        }
+
+        // MARK: - Session Rotation Tests
+
+        @Test("New session requires new trigger activation")
+        func newSessionRequiresNewTrigger() async throws {
+            let sut = getSut(eventTriggers: ["purchase_completed"])
+            let integration = sut.getReplayIntegration()
+            #expect(integration?.isActive() == false)
+
+            sut.capture("purchase_completed")
+            #expect(integration?.isActive() == true)
+
+            sut.sessionManager.setSessionId(UUID().uuidString)
+
+            #expect(integration?.isActive() == false)
+
+            sut.close()
+        }
+
+        @Test("Trigger activation persists within same session")
+        func triggerPersistsInSameSession() async throws {
+            let sut = getSut(eventTriggers: ["purchase_completed"])
+            let integration = sut.getReplayIntegration()
+
+            sut.capture("purchase_completed")
+            #expect(integration?.isActive() == true)
+
+            sut.capture("other_event")
+            sut.capture("another_event")
+
+            #expect(integration?.isActive() == true)
+
+            sut.close()
+        }
+
+        // MARK: - Manual Start Tests
+
+        @Test("Manual start respects event triggers")
+        func manualStartRespectsTriggers() async throws {
+            let sut = getSut(eventTriggers: ["purchase_completed"])
+            let integration = sut.getReplayIntegration()
+            #expect(integration != nil)
+            #expect(integration?.isActive() == false)
+
+            // Manual start should still wait for trigger
+            sut.startSessionRecording()
+
+            #expect(integration?.isActive() == false)
+
+            // Trigger event activates replay
+            sut.capture("purchase_completed")
+            #expect(integration?.isActive() == true)
+
+            sut.close()
+        }
+
+        // MARK: - Stop/Start Tests
+
+        @Test("Trigger event does not restart replay when manually stopped")
+        func triggerDoesNotRestartWhenManuallyStopped() async throws {
+            let sut = getSut(eventTriggers: ["purchase_completed"])
+            let integration = sut.getReplayIntegration()
+            #expect(integration != nil)
+            #expect(integration?.isActive() == false)
+
+            // Activate with trigger
+            sut.capture("purchase_completed")
+            #expect(integration?.isActive() == true)
+
+            // Manually stop
+            sut.stopSessionRecording()
+            #expect(integration?.isActive() == false)
+
+            // Trigger event should NOT restart (event listener is removed on stop)
+            sut.capture("purchase_completed")
+            #expect(integration?.isActive() == false)
+
+            sut.close()
+        }
+
+        // MARK: - Empty Triggers Tests
+
+        @Test("Empty triggers array means no waiting")
+        func emptyTriggersNoWaiting() async throws {
+            let sut = getSut(eventTriggers: nil)
+            let integration = sut.getReplayIntegration()
+            #expect(integration != nil)
+            #expect(integration?.isActive() == true)
+
+            sut.close()
+        }
+
+        // MARK: - React Native Opt-Out Tests
+
+        @Test("React Native opts out of native event-trigger gating")
+        func reactNativeOptsOutOfTriggerGating() async throws {
+            let original = txlemetrySdkName
+            txlemetrySdkName = "posthog-react-native"
+            defer { txlemetrySdkName = original }
+
+            // Triggers are configured, but React Native evaluates them in its JS layer, so the native
+            // integration must not gate — recording is active immediately without a trigger firing.
+            // (The non-RN path that waits for a trigger is covered by isActiveWhileWaitingForTrigger.)
+            let sut = getSut(eventTriggers: ["purchase_completed"])
+            let integration = sut.getReplayIntegration()
+            #expect(integration != nil)
+            #expect(integration?.isActive() == true)
+
+            sut.close()
+        }
+
+        // MARK: - debugProperties() Trigger Status
+
+        @Test("trigger status reflects pending state before either trigger resolves, then activation as each fires")
+        func triggerStatusReflectsCurrentState() async throws {
+            let sut = getSut(eventTriggers: ["purchase_completed"], linkedFlagNotMatched: true)
+            let integration = try #require(sut.getReplayIntegration())
+            defer { sut.close() }
+
+            // Neither trigger has resolved yet — the integration hasn't even started (event-trigger
+            // gated), but trigger status is computed fresh regardless of active state.
+            var props = integration.debugProperties()
+            #expect(props["$sdk_debug_replay_linked_flag_trigger_status"] as? String == "trigger_pending")
+            #expect(props["$sdk_debug_replay_event_trigger_status"] as? String == "trigger_pending")
+            let pending = props["$sdk_debug_replay_pending_trigger_conditions"] as? [String] ?? []
+            #expect(Set(pending) == Set(["linked_flag", "event_trigger"]))
+
+            sut.capture("purchase_completed")
+
+            props = integration.debugProperties()
+            #expect(props["$sdk_debug_replay_event_trigger_status"] as? String == "trigger_activated")
+            let pendingAfter = props["$sdk_debug_replay_pending_trigger_conditions"] as? [String] ?? []
+            #expect(!pendingAfter.contains("event_trigger"))
+        }
+    }
+#endif

@@ -1,0 +1,108 @@
+//
+//  QueueEndpoint+Factories.swift
+//  Txlemetry
+//
+
+import Foundation
+
+/// Retry policy shared by `/batch` (events) and `/snapshot` (replay): 408, 429,
+/// the listed 5xx, plus 3xx redirects.
+private func isEventsRetriableStatusCode(_ code: Int) -> Bool {
+    [408, 429, 500, 502, 503, 504].contains(code)
+        || (300 ... 399).contains(code)
+}
+
+extension QueueEndpoint where Record == TxlemetryEvent {
+    /// `/batch` endpoint for analytics events.
+    static func batch(api: TxlemetryApi) -> QueueEndpoint<TxlemetryEvent> {
+        QueueEndpoint<TxlemetryEvent>(
+            storageKey: .queue,
+            oldStorageKeys: [.oldQueueFolder, .oldQueuePlist],
+            dispatchQueueLabel: "com.txlemetry.Queue",
+            initialCap: { $0.maxBatchSize },
+            initialFlushAt: { $0.flushAt },
+            maxQueueSize: { $0.maxQueueSize },
+            flushIntervalSeconds: { $0.flushIntervalSeconds },
+            rateCapMax: { _ in 0 },
+            rateCapWindowSeconds: { _ in 0 },
+            encode: { event in toJSONData(event.toJSON()) },
+            decode: { data in TxlemetryEvent.fromJSON(data) },
+            describe: { event in "event '\(event.event)'" },
+            send: { events, completion in
+                api.batch(events: events, completion: completion)
+            },
+            isRetriableStatusCode: isEventsRetriableStatusCode
+        )
+    }
+
+    /// `/snapshot` endpoint for session-replay snapshots. Shares its retry
+    /// policy with `/batch`.
+    static func snapshot(api: TxlemetryApi) -> QueueEndpoint<TxlemetryEvent> {
+        QueueEndpoint<TxlemetryEvent>(
+            storageKey: .replayQeueue,
+            oldStorageKeys: [.oldReplayQueue],
+            dispatchQueueLabel: "com.txlemetry.ReplayQueue",
+            initialCap: { $0.maxBatchSize },
+            initialFlushAt: { $0.flushAt },
+            maxQueueSize: { $0.maxQueueSize },
+            flushIntervalSeconds: { $0.flushIntervalSeconds },
+            rateCapMax: { _ in 0 },
+            rateCapWindowSeconds: { _ in 0 },
+            encode: { event in toJSONData(event.toJSON()) },
+            decode: { data in TxlemetryEvent.fromJSON(data) },
+            describe: { _ in "snapshot" },
+            send: { events, completion in
+                api.snapshot(events: events, completion: completion)
+            },
+            isRetriableStatusCode: isEventsRetriableStatusCode
+        )
+    }
+}
+
+extension QueueEndpoint where Record == TxlemetryLogRecord {
+    /// `/i/v1/logs` OTLP/JSON endpoint. Retries `408`, `429`, and all 5xx;
+    /// 3xx redirects are not retriable.
+    ///
+    /// `resourceAttributes` is taken by value — the caller snapshots
+    /// `config.logs` once at SDK setup and passes the merged dict here, so
+    /// post-setup mutations of `config.logs.resourceAttributes` are not
+    /// honored (matches the doc contract on `TxlemetryLogsConfig`).
+    static func logs(
+        api: TxlemetryApi,
+        resourceAttributes: [String: Any]
+    ) -> QueueEndpoint<TxlemetryLogRecord> {
+        // Snapshot the SDK version once so it can't disagree with the
+        // `telemetry.sdk.version` we baked into `resourceAttributes`.
+        let scopeVersion = txlemetryVersion
+        return QueueEndpoint<TxlemetryLogRecord>(
+            storageKey: .logsQueue,
+            oldStorageKeys: [],
+            dispatchQueueLabel: "com.txlemetry.LogsQueue",
+            initialCap: { $0.logs.maxBatchSize },
+            initialFlushAt: { $0.logs.flushAt },
+            maxQueueSize: { $0.logs.maxBufferSize },
+            flushIntervalSeconds: { $0.logs.flushIntervalSeconds },
+            // Clamp to 0; a negative window would make `elapsed >= window`
+            // trivially true and reset the counter on every call.
+            rateCapMax: { max(0, $0.logs.rateCapMaxLogs) },
+            rateCapWindowSeconds: { max(0, $0.logs.rateCapWindowSeconds) },
+            encode: { record in toJSONData(record.toStorageJSON()) },
+            decode: { data in
+                guard let json = fromJSONData(data) else { return nil }
+                return TxlemetryLogRecord.fromStorageJSON(json)
+            },
+            describe: { _ in "log" },
+            send: { records, completion in
+                let payload = TxlemetryLogsOTLP.buildPayload(
+                    records: records,
+                    resourceAttributes: resourceAttributes,
+                    scopeVersion: scopeVersion
+                )
+                api.logs(payload: payload, completion: completion)
+            },
+            isRetriableStatusCode: { code in
+                code == 408 || code == 429 || (500 ... 599).contains(code)
+            }
+        )
+    }
+}

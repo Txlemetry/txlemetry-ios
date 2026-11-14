@@ -1,0 +1,6 @@
+framework module Txlemetry {
+  umbrella header "Txlemetry.h"
+
+  export *
+  module * { export * }
+}

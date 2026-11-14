@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/PostHog/posthog-ios",
+  "upstreamVersion": "3.84.0",
+  "upstreamCommit": "e751c190562878700599243971a04fae17798480",
+  "archiveSha256": "1750e00b45f746886ae1f465f94f07e12c2ed63cf3da97dfeec969616d294061",
+  "license": "MIT",
+  "validation": "pending",
+  "importedFiles": 634
+}

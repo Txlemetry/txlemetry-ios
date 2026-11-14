@@ -1,0 +1,5 @@
+module TxlemetryObjCExceptionSupport {
+  header "../../ObjCExceptionSupport/PHObjCExceptionCatcher.h"
+  header "../../ObjCExceptionSupport/PHURLSessionTaskSafeAccess.h"
+  export *
+}

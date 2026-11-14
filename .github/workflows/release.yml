@@ -1,0 +1,41 @@
+name: Release
+
+# Pushing a version tag (for example 4.0.0) makes the Swift package available at that tag and publishes the
+# matching podspec to CocoaPods trunk. The tag must equal s.version in Txlemetry.podspec.
+
+on:
+    push:
+        tags: ['[0-9]+.[0-9]+.[0-9]+']
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    cocoapods:
+        runs-on: macos-15
+        timeout-minutes: 60
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            - name: Check tag matches the podspec version
+              run: |
+                  version=$(sed -n 's/^ *s.version *= *"\(.*\)"/\1/p' Txlemetry.podspec | head -n 1)
+                  echo "podspec version: $version, ref: $GITHUB_REF_NAME"
+                  if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$version" ]; then
+                    echo "::error::Tag $GITHUB_REF_NAME does not match podspec version $version"
+                    exit 1
+                  fi
+
+            - name: Install platforms
+              run: |
+                  for platform in tvOS watchOS visionOS; do
+                    xcodebuild -downloadPlatform "$platform" || echo "$platform already installed or not downloadable"
+                  done
+
+            - name: Publish to CocoaPods trunk
+              env:
+                  COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+              run: |
+                  if [ -z "$COCOAPODS_TRUNK_TOKEN" ]; then echo "::error::Set the COCOAPODS_TRUNK_TOKEN repository secret"; exit 1; fi
+                  pod trunk push Txlemetry.podspec --allow-warnings

@@ -1,0 +1,924 @@
+//
+//  TxlemetryIdentityTests.swift
+//  Txlemetry
+//
+//  Created by Ioannis Josephides on 14/04/2025.
+//
+
+import Foundation
+@testable import Txlemetry
+import Testing
+
+@Suite("Identity tests", .serialized)
+class TxlemetryIdentityTests {
+    let server: MockTxlemetryServer
+
+    var cleanupJobs: [() -> Void]
+
+    func getSut(
+        reuseAnonymousId: Bool = false,
+        flushAt: Int = 1
+    ) -> TxlemetrySDK {
+        let config = TxlemetryConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+        config.captureApplicationLifecycleEvents = false
+        config.reuseAnonymousId = reuseAnonymousId
+        config.flushAt = flushAt
+        config.maxBatchSize = flushAt
+        config.disableFlushOnBackgroundForTesting = true
+        config.disableReachabilityForTesting = true
+        let sut = TxlemetrySDK.with(config)
+        cleanupJobs.append {
+            sut.reset()
+            sut.close()
+            deleteSafely(applicationSupportDirectoryURL())
+        }
+        return sut
+    }
+
+    init() throws {
+        server = MockTxlemetryServer()
+        server.start()
+        cleanupJobs = []
+    }
+
+    deinit {
+        server.reset()
+        for cleanup in cleanupJobs {
+            cleanup()
+        }
+    }
+
+    @Test("does not clear anonymousId on reset()")
+    func doesNotClearAnonymousIdOnReset() async throws {
+        let sut = getSut(reuseAnonymousId: true)
+        let oldAnonId = sut.getAnonymousId()
+        sut.reset()
+        let newAnonId = sut.getAnonymousId()
+        #expect(oldAnonId == newAnonId)
+    }
+
+    @Test("does not clear anonymousId on close()")
+    func doesNotClearAnonymousIdOnClose() async throws {
+        var sut = getSut(reuseAnonymousId: true)
+
+        let oldAnonId = sut.getAnonymousId()
+        sut.close()
+
+        sut = getSut(reuseAnonymousId: true)
+        let newAnonId = sut.getAnonymousId()
+
+        #expect(oldAnonId == newAnonId)
+    }
+
+    @Test("anonymousId is not overwritten on re-identify when reuseAnonymousId is true")
+    func anonymousIdIsNotOverwrittenOnReIdentifyWhenReuseAnonymousIdIsTrue() async throws {
+        let sut = getSut(reuseAnonymousId: true)
+        let oldAnonId = sut.getAnonymousId()
+        sut.identify("my_user_id")
+        #expect(sut.getDistinctId() == "my_user_id")
+        sut.identify("my_user_id2")
+        #expect(sut.getDistinctId() == "my_user_id")
+        sut.reset()
+        let newAnonId = sut.getAnonymousId()
+        #expect(oldAnonId == newAnonId)
+        #expect(oldAnonId == sut.getDistinctId())
+    }
+
+    @Test("anonymousId is retained across series of identify() and reset() reuseAnonymousId is true")
+    func anonymousIdIsRetailainedAcrossSeriesOfIdentifyAndResetReuseAnonymousIdIsTrue() async throws {
+        var sut = getSut(reuseAnonymousId: true)
+        let oldAnonId = sut.getAnonymousId()
+        sut.identify("my_user_id")
+        #expect(sut.getDistinctId() == "my_user_id")
+        sut.reset()
+        #expect(oldAnonId == sut.getAnonymousId())
+
+        sut = getSut(reuseAnonymousId: true)
+        sut.identify("my_user_id2")
+        #expect(sut.getDistinctId() == "my_user_id2")
+        sut.reset()
+        #expect(oldAnonId == sut.getDistinctId())
+    }
+
+    @Test("skip $anon_distinct_id in $identify event when flag reuseAnonymousId is true")
+    func skipAnonDistinctIdInIdentifyEventWhenFlagReuseAnonymousIdIsTrue() async throws {
+        let sut = getSut(reuseAnonymousId: true)
+        sut.identify("my_user_id")
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 1)
+        #expect(events[0].properties["distinct_id"] as? String == "my_user_id")
+        #expect(events[0].properties["$anon_distinct_id"] == nil)
+    }
+
+    @Test("identify sets distinct and anon Ids")
+    func identifySetsDistinctAndAnonIds() async throws {
+        let sut = getSut()
+        let distId = sut.getDistinctId()
+
+        sut.identify("newDistinctId")
+
+        #expect(sut.getDistinctId() == "newDistinctId")
+        #expect(sut.getAnonymousId() == distId)
+
+        // Finish this test's upload before the next test installs its batch recorder.
+        let events = try await getServerEvents(server)
+        #expect(events.map(\.event) == ["$identify"])
+        #expect(events.first?.distinctId == "newDistinctId")
+    }
+
+    @Test("captures the capture event with a custom distinctId")
+    func capturesCaptureEventWithCustomDistinctId() async throws {
+        let sut = getSut()
+
+        sut.capture("event",
+                    distinctId: "the_custom_distinct_id",
+                    properties: ["foo": "bar"],
+                    userProperties: ["userProp": "value"],
+                    userPropertiesSetOnce: ["userPropOnce": "value"],
+                    groups: ["groupProp": "value"])
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 1)
+        #expect(events.first!.distinctId == "the_custom_distinct_id")
+    }
+
+    @Test("captures an identify event")
+    func capturesIdentifyEvent() async throws {
+        let sut = getSut()
+
+        sut.identify("distinctId",
+                     userProperties: ["userProp": "value"],
+                     userPropertiesSetOnce: ["userPropOnce": "value"])
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 1)
+
+        let event = events.first!
+        #expect(event.event == "$identify")
+
+        #expect(event.distinctId == "distinctId")
+        let anonId = sut.getAnonymousId()
+        #expect(event.properties["$anon_distinct_id"] as? String == anonId)
+        #expect(event.properties["$is_identified"] as? Bool == true)
+
+        let set = event.properties["$set"] as? [String: Any] ?? [:]
+        #expect(set["userProp"] as? String == "value")
+
+        let setOnce = event.properties["$set_once"] as? [String: Any] ?? [:]
+        #expect(setOnce["userPropOnce"] as? String == "value")
+    }
+
+    @Test("captures an event with is identified false")
+    func capturesEventWithIsIdentifiedFalse() async throws {
+        let sut = getSut()
+
+        sut.capture("test",
+                    userProperties: ["userProp": "value"],
+                    userPropertiesSetOnce: ["userPropOnce": "value"])
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 1)
+
+        let event = events.first!
+
+        #expect(event.properties["$is_identified"] as? Bool == false)
+    }
+
+    @Test("does not capture identify event if already identified")
+    func doesNotCaptureIdentifyEventIfAlreadyIdentified() async throws {
+        let sut = getSut(
+            flushAt: 2
+        )
+
+        sut.identify("distinctId",
+                     userProperties: ["userProp": "value"],
+                     userPropertiesSetOnce: ["userPropOnce": "value"])
+
+        sut.identify("distinctId")
+        sut.capture("satisfy_queue")
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 2)
+
+        #expect(events[0].event == "$identify")
+        #expect(events[1].event == "satisfy_queue")
+
+        #expect(events[0].distinctId == "distinctId")
+        let anonId = sut.getAnonymousId()
+        #expect(events[0].properties["$anon_distinct_id"] as? String == anonId)
+        #expect(events[0].properties["$is_identified"] as? Bool == true)
+
+        let set = events[0].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set["userProp"] as? String == "value")
+
+        let setOnce = events[0].properties["$set_once"] as? [String: Any] ?? [:]
+        #expect(setOnce["userPropOnce"] as? String == "value")
+    }
+
+    @Test("updates user props if already identified but user properties are set")
+    func updatesUserPropsWhenAlreadyIdentified() async throws {
+        let sut = getSut(
+            flushAt: 2
+        )
+
+        sut.identify("distinctId",
+                     userProperties: ["userProp": "value"],
+                     userPropertiesSetOnce: ["userPropOnce": "value"])
+
+        sut.identify("distinctId",
+                     userProperties: ["userProp2": "value2"],
+                     userPropertiesSetOnce: ["userPropOnce2": "value2"])
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 2)
+
+        #expect(events[0].event == "$identify")
+        #expect(events[1].event == "$set")
+
+        #expect(events[0].distinctId == "distinctId")
+        #expect(events[1].distinctId == events[0].distinctId)
+
+        let anonId = sut.getAnonymousId()
+        #expect(events[0].properties["$anon_distinct_id"] as? String == anonId)
+        #expect(events[0].properties["$is_identified"] as? Bool == true)
+
+        let set0 = events[0].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set0["userProp"] as? String == "value")
+
+        let set1 = events[1].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set1["userProp2"] as? String == "value2")
+
+        let setOnce0 = events[0].properties["$set_once"] as? [String: Any] ?? [:]
+        #expect(setOnce0["userPropOnce"] as? String == "value")
+
+        let setOnce1 = events[1].properties["$set_once"] as? [String: Any] ?? [:]
+        #expect(setOnce1["userPropOnce2"] as? String == "value2")
+    }
+
+    @Test("does not capture user props for another distinctId even if user properties are set")
+    func doesNotCaptureUserPropsForDifferentDistinctId() async throws {
+        let sut = getSut(
+            flushAt: 2
+        )
+
+        sut.identify("distinctId",
+                     userProperties: ["userProp": "value"],
+                     userPropertiesSetOnce: ["userPropOnce": "value"])
+
+        sut.identify("distinctId2",
+                     userProperties: ["userProp2": "value2"],
+                     userPropertiesSetOnce: ["userPropOnce2": "value2"])
+
+        sut.capture("satisfy_queue")
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 2)
+
+        #expect(events[0].event == "$identify")
+        #expect(events[1].event == "satisfy_queue")
+
+        #expect(events[0].distinctId == "distinctId")
+        let anonId = sut.getAnonymousId()
+        #expect(events[0].properties["$anon_distinct_id"] as? String == anonId)
+        #expect(events[0].properties["$is_identified"] as? Bool == true)
+
+        let set = events[0].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set["userProp"] as? String == "value")
+
+        let setOnce = events[0].properties["$set_once"] as? [String: Any] ?? [:]
+        #expect(setOnce["userPropOnce"] as? String == "value")
+    }
+
+    @Test("captures an alias event")
+    func capturesAliasEvent() async throws {
+        let sut = getSut()
+
+        sut.alias("theAlias")
+
+        let events = getBatchedEvents(server)
+
+        #expect(events.count == 1)
+
+        let event = events.first!
+        #expect(event.event == "$create_alias")
+        #expect(event.properties["alias"] as? String == "theAlias")
+    }
+
+    @Test("setups default IDs")
+    func setupsDefaultIds() async throws {
+        let sut = getSut()
+
+        #expect(sut.getAnonymousId() != "")
+        #expect(sut.getDistinctId() == sut.getAnonymousId())
+    }
+
+    // MARK: - setPersonProperties tests
+
+    @Test("setPersonProperties sends $set event with properties")
+    func setPersonPropertiesSendsSetEvent() async throws {
+        let sut = getSut()
+
+        sut.setPersonProperties(
+            userPropertiesToSet: ["name": "John", "age": 30],
+            userPropertiesToSetOnce: ["created_at": "2024-01-01"]
+        )
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 1)
+
+        let event = events.first!
+        #expect(event.event == "$set")
+
+        let set = event.properties["$set"] as? [String: Any] ?? [:]
+        #expect(set["name"] as? String == "John")
+        #expect(set["age"] as? Int == 30)
+
+        let setOnce = event.properties["$set_once"] as? [String: Any] ?? [:]
+        #expect(setOnce["created_at"] as? String == "2024-01-01")
+    }
+
+    @Test("setPersonProperties deduplicates identical calls")
+    func setPersonPropertiesDeduplicatesIdenticalCalls() async throws {
+        let sut = getSut(flushAt: 2)
+
+        // Call twice with same properties
+        sut.setPersonProperties(userPropertiesToSet: ["name": "John"])
+        sut.setPersonProperties(userPropertiesToSet: ["name": "John"])
+
+        // Add a different event to trigger flush
+        sut.capture("test_event")
+
+        let events = try await getServerEvents(server)
+
+        // Should only have 1 $set event + 1 test_event
+        #expect(events.count == 2)
+        #expect(events[0].event == "$set")
+        #expect(events[1].event == "test_event")
+    }
+
+    @Test("setPersonProperties allows different property values")
+    func setPersonPropertiesAllowsDifferentPropertyValues() async throws {
+        let sut = getSut(flushAt: 2)
+
+        sut.setPersonProperties(userPropertiesToSet: ["name": "John"])
+        sut.setPersonProperties(userPropertiesToSet: ["name": "Jane"])
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 2)
+        #expect(events[0].event == "$set")
+        #expect(events[1].event == "$set")
+
+        let set0 = events[0].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set0["name"] as? String == "John")
+
+        let set1 = events[1].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set1["name"] as? String == "Jane")
+    }
+
+    @Test("setPersonProperties with only setOnce properties")
+    func setPersonPropertiesWithOnlySetOnceProperties() async throws {
+        let sut = getSut()
+
+        sut.setPersonProperties(
+            userPropertiesToSet: nil,
+            userPropertiesToSetOnce: ["first_seen": "2024-01-01"]
+        )
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 1)
+
+        let event = events.first!
+        #expect(event.event == "$set")
+
+        let setOnce = event.properties["$set_once"] as? [String: Any] ?? [:]
+        #expect(setOnce["first_seen"] as? String == "2024-01-01")
+    }
+
+    @Test("setPersonProperties ignores empty properties")
+    func setPersonPropertiesIgnoresEmptyProperties() async throws {
+        let sut = getSut(flushAt: 1)
+
+        sut.setPersonProperties(userPropertiesToSet: [:], userPropertiesToSetOnce: [:])
+        sut.setPersonProperties(userPropertiesToSet: nil, userPropertiesToSetOnce: nil)
+
+        // Add event to ensure flush happens
+        sut.capture("test_event")
+
+        let events = try await getServerEvents(server)
+
+        // Should only have the test_event, no $set events
+        #expect(events.count == 1)
+        #expect(events[0].event == "test_event")
+    }
+
+    @Test("setPersonProperties uses current distinctId")
+    func setPersonPropertiesUsesCurrentDistinctId() async throws {
+        let sut = getSut(flushAt: 2)
+
+        sut.identify("my_user_id")
+        sut.setPersonProperties(userPropertiesToSet: ["plan": "premium"])
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 2)
+        #expect(events[0].event == "$identify")
+        #expect(events[1].event == "$set")
+        #expect(events[1].distinctId == "my_user_id")
+    }
+
+    @Test("setPersonProperties deduplicates nested dictionaries with different key order")
+    func setPersonPropertiesDeduplicatesNestedDictionariesWithDifferentKeyOrder() async throws {
+        let sut = getSut(flushAt: 2)
+
+        // First call with nested dictionary in one key order
+        sut.setPersonProperties(userPropertiesToSet: [
+            "z_key": "value",
+            "a_key": "value",
+            "nested": [
+                "z_inner": 1,
+                "a_inner": 2,
+            ] as [String: Any],
+        ])
+
+        // Second call with same values but different key insertion order
+        sut.setPersonProperties(userPropertiesToSet: [
+            "z_key": "value",
+            "nested": [
+                "a_inner": 2,
+                "z_inner": 1,
+            ] as [String: Any],
+            "a_key": "value",
+        ])
+
+        // Add a different event to trigger flush
+        sut.capture("test_event")
+
+        let events = try await getServerEvents(server)
+
+        // Should only have 1 $set event (second was deduplicated) + 1 test_event
+        #expect(events.count == 2)
+        #expect(events[0].event == "$set")
+        #expect(events[1].event == "test_event")
+    }
+
+    // MARK: - Identify Deduplication Tests
+
+    @Test("identify deduplicates $set event when called with same properties for same user")
+    func identifyDeduplicatesSetEventWithSameProperties() async throws {
+        let sut = getSut(flushAt: 2)
+
+        // First identify creates the user
+        sut.identify("user123")
+
+        // Second identify with same distinctId sends $set
+        sut.identify("user123", userProperties: ["name": "John"])
+
+        // Third identify with same properties should be deduplicated
+        sut.identify("user123", userProperties: ["name": "John"])
+
+        let events = try await getServerEvents(server)
+
+        // Should have: $identify + 1 $set (second $set deduplicated)
+        #expect(events.count == 2)
+        #expect(events[0].event == "$identify")
+        #expect(events[1].event == "$set")
+    }
+
+    @Test("identify does not deduplicate $set event when properties differ")
+    func identifyDoesNotDeduplicateSetEventWithDifferentProperties() async throws {
+        let sut = getSut(flushAt: 3)
+
+        // First identify creates the user
+        sut.identify("user123")
+
+        // Second identify with properties
+        sut.identify("user123", userProperties: ["name": "John"])
+
+        // Third identify with different properties - should NOT be deduplicated
+        sut.identify("user123", userProperties: ["name": "Jane"])
+
+        let events = try await getServerEvents(server)
+
+        // Should have: $identify + 2 $set events
+        #expect(events.count == 3)
+        #expect(events[0].event == "$identify")
+        #expect(events[1].event == "$set")
+        #expect(events[2].event == "$set")
+
+        let set1 = events[1].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set1["name"] as? String == "John")
+
+        let set2 = events[2].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set2["name"] as? String == "Jane")
+    }
+
+    @Test("identify and setPersonProperties share deduplication cache")
+    func identifyAndSetPersonPropertiesShareDeduplicationCache() async throws {
+        let sut = getSut(flushAt: 2)
+
+        // First identify creates the user
+        sut.identify("user123")
+
+        // Set properties via identify
+        sut.identify("user123", userProperties: ["name": "John"])
+
+        // Same properties via setPersonProperties - should be deduplicated
+        sut.setPersonProperties(userPropertiesToSet: ["name": "John"])
+
+        let events = try await getServerEvents(server)
+
+        // Should have: $identify + 1 $set (setPersonProperties deduplicated)
+        #expect(events.count == 2)
+        #expect(events[0].event == "$identify")
+        #expect(events[1].event == "$set")
+    }
+
+    @Test("identify deduplicates with setOnce properties")
+    func identifyDeduplicatesWithSetOnceProperties() async throws {
+        let sut = getSut(flushAt: 2)
+
+        sut.identify("user123")
+
+        sut.identify("user123",
+                     userProperties: ["name": "John"],
+                     userPropertiesSetOnce: ["first_seen": "2024-01-01"])
+
+        // Same properties again - should be deduplicated
+        sut.identify("user123",
+                     userProperties: ["name": "John"],
+                     userPropertiesSetOnce: ["first_seen": "2024-01-01"])
+
+        let events = try await getServerEvents(server)
+
+        #expect(events.count == 2)
+        #expect(events[0].event == "$identify")
+        #expect(events[1].event == "$set")
+    }
+
+    @Test("opted-out properties can be sent after relaunch and consent")
+    func optedOutPropertiesCanBeSentAfterRelaunch() async throws {
+        let firstLaunch = getSut(flushAt: 100)
+        firstLaunch.optOut()
+        firstLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        firstLaunch.close()
+        server.reset()
+
+        let secondLaunch = getSut(flushAt: 100)
+        secondLaunch.optIn()
+        secondLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        secondLaunch.capture("second_launch")
+        secondLaunch.flush()
+
+        let events = try await getServerEvents(server)
+        #expect(events.map(\.event) == ["$set", "second_launch"])
+    }
+
+    @Test("a dropped set can be retried after relaunch")
+    func droppedSetCanBeRetriedAfterRelaunch() async throws {
+        let firstLaunch = getSut(flushAt: 100)
+        firstLaunch.config.setBeforeSend { event in
+            event.event == "$set" ? nil : event
+        }
+        firstLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        firstLaunch.close()
+        server.reset()
+
+        let secondLaunch = getSut(flushAt: 100)
+        secondLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        secondLaunch.capture("second_launch")
+        secondLaunch.flush()
+
+        let events = try await getServerEvents(server)
+        #expect(events.map(\.event) == ["$set", "second_launch"])
+    }
+
+    @Test("reset clears persisted deduplication for the same identity")
+    func resetClearsPersistedDeduplication() async throws {
+        let firstLaunch = getSut(reuseAnonymousId: true, flushAt: 100)
+        firstLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        firstLaunch.flush()
+        _ = try await getServerEvents(server)
+        let distinctId = firstLaunch.getDistinctId()
+        firstLaunch.reset()
+        firstLaunch.close()
+        server.reset()
+
+        let secondLaunch = getSut(reuseAnonymousId: true, flushAt: 100)
+        #expect(secondLaunch.getDistinctId() == distinctId)
+        secondLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        secondLaunch.capture("second_launch")
+        secondLaunch.flush()
+
+        let events = try await getServerEvents(server)
+        #expect(events.map(\.event) == ["$set", "second_launch"])
+    }
+
+    @Test("a failed queue write does not suppress properties after relaunch")
+    func failedQueueWriteCanBeRetriedAfterRelaunch() async throws {
+        let firstLaunch = getSut(flushAt: 100)
+        let queueURL = TxlemetryStorage(firstLaunch.config).url(forKey: .queue)
+        try FileManager.default.removeItem(at: queueURL)
+        try Data().write(to: queueURL)
+        firstLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        firstLaunch.close()
+        try FileManager.default.removeItem(at: queueURL)
+        server.reset()
+
+        let secondLaunch = getSut(flushAt: 100)
+        secondLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        secondLaunch.capture("second_launch")
+        secondLaunch.flush()
+
+        let events = try await getServerEvents(server)
+        #expect(events.map(\.event) == ["$set", "second_launch"])
+    }
+
+    @Test("a failed queue write still notifies capture subscribers")
+    func failedQueueWriteStillNotifiesSubscribers() throws {
+        let sut = getSut(flushAt: 100)
+        let queueURL = TxlemetryStorage(sut.config).url(forKey: .queue)
+        try FileManager.default.removeItem(at: queueURL)
+        try Data().write(to: queueURL)
+
+        var received: [String] = []
+        let token = sut.onEventCaptured.subscribe { received.append($0.event) }
+
+        sut.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        sut.capture("after_failed_write")
+
+        #expect(received.contains("$set"))
+        #expect(received.contains("after_failed_write"))
+
+        withExtendedLifetime(token) {}
+        deleteSafely(queueURL)
+    }
+
+    @Test("a dropped anonymous-to-identified set can be retried after relaunch")
+    func droppedTransitionCanBeRetriedAfterRelaunch() async throws {
+        let firstLaunch = getSut(flushAt: 100)
+        let distinctId = firstLaunch.getDistinctId()
+        firstLaunch.config.setBeforeSend { event in
+            event.event == "$set" ? nil : event
+        }
+        firstLaunch.identify(distinctId, userProperties: ["tier": "pro"])
+        firstLaunch.close()
+        server.reset()
+
+        let secondLaunch = getSut(flushAt: 100)
+        secondLaunch.identify(distinctId, userProperties: ["tier": "pro"])
+        secondLaunch.capture("second_launch")
+        secondLaunch.flush()
+
+        let events = try await getServerEvents(server)
+        #expect(events.map(\.event) == ["$set", "second_launch"])
+    }
+
+    @Test("concurrent identical property calls enqueue only one set")
+    func concurrentIdenticalPropertiesAreDeduplicated() async throws {
+        let sut = getSut(flushAt: 100)
+        let beforeSendCalls = DispatchGroup()
+        beforeSendCalls.enter()
+        beforeSendCalls.enter()
+        sut.config.setBeforeSend { event in
+            if event.event == "$set" {
+                beforeSendCalls.leave()
+                #expect(beforeSendCalls.wait(timeout: .now() + 5) == .success)
+            }
+            return event
+        }
+
+        DispatchQueue.concurrentPerform(iterations: 2) { _ in
+            sut.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        }
+        sut.capture("after_concurrent_calls")
+        sut.flush()
+
+        let events = try await getServerEvents(server)
+        #expect(events.map(\.event) == ["$set", "after_concurrent_calls"])
+    }
+
+    @Test("changed beforeSend output is captured after relaunch", arguments: [false, true])
+    func changedBeforeSendOutputIsCapturedAfterRelaunch(useIdentify: Bool) async throws {
+        func update(_ sdk: TxlemetrySDK) {
+            if useIdentify {
+                sdk.identify("user123", userProperties: ["tier": "internal_pro"])
+            } else {
+                sdk.setPersonProperties(userPropertiesToSet: ["tier": "internal_pro"])
+            }
+        }
+
+        let firstLaunch = getSut(flushAt: 100)
+        update(firstLaunch)
+        firstLaunch.flush()
+        _ = try await getServerEvents(server)
+        firstLaunch.close()
+        server.reset()
+
+        let secondLaunch = getSut(flushAt: 100)
+        secondLaunch.config.setBeforeSend { event in
+            if event.event == "$set" {
+                event.properties["$set"] = ["tier": "pro"]
+            }
+            return event
+        }
+        update(secondLaunch)
+        update(secondLaunch)
+        secondLaunch.capture("second_launch")
+        secondLaunch.flush()
+
+        let events = try await getServerEvents(server)
+        #expect(events.map(\.event) == ["$set", "second_launch"])
+        #expect((events.first?.properties["$set"] as? [String: String])?["tier"] == "pro")
+    }
+
+    @Test("sanitized-empty properties are deduplicated within and across launches", arguments: [false, true], [false, true])
+    func sanitizedEmptyPropertiesAreDeduplicated(useIdentify: Bool, setOnce: Bool) async throws {
+        let invalidProperties: [String: Any] = ["id": UUID()]
+        func update(_ sdk: TxlemetrySDK) {
+            if useIdentify {
+                sdk.identify("user123",
+                             userProperties: setOnce ? nil : invalidProperties,
+                             userPropertiesSetOnce: setOnce ? invalidProperties : nil)
+            } else {
+                sdk.setPersonProperties(userPropertiesToSet: setOnce ? nil : invalidProperties,
+                                        userPropertiesToSetOnce: setOnce ? invalidProperties : nil)
+            }
+        }
+
+        let firstLaunch = getSut(flushAt: 100)
+        update(firstLaunch)
+        update(firstLaunch)
+        firstLaunch.capture("first_launch")
+        firstLaunch.flush()
+        let firstEvents = try await getServerEvents(server)
+        #expect(firstEvents.map(\.event) == [useIdentify ? "$identify" : "$set", "first_launch"])
+        #expect((firstEvents.first?.properties[setOnce ? "$set_once" : "$set"] as? [String: Any])?.isEmpty == true)
+        firstLaunch.close()
+        server.reset()
+
+        let secondLaunch = getSut(flushAt: 100)
+        update(secondLaunch)
+        secondLaunch.capture("second_launch")
+        secondLaunch.flush()
+        let secondEvents = try await getServerEvents(server)
+        #expect(secondEvents.map(\.event) == ["second_launch"])
+    }
+
+    @Test("enqueue failures still notify local integrations", arguments: [false, true])
+    func enqueueFailuresStillNotifyLocalIntegrations(personUpdate: Bool) throws {
+        let sut = getSut(flushAt: 100)
+        let queueURL = TxlemetryStorage(sut.config).url(forKey: .queue)
+        try FileManager.default.removeItem(at: queueURL)
+        try Data().write(to: queueURL)
+        var capturedEvents: [String] = []
+        let token = sut.onEventCaptured.subscribe { capturedEvents.append($0.event) }
+        defer { withExtendedLifetime(token) {} }
+
+        func capture() {
+            if personUpdate {
+                sut.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+            } else {
+                sut.capture("survey_trigger")
+            }
+        }
+
+        capture()
+        capture()
+        #expect(capturedEvents == Array(repeating: personUpdate ? "$set" : "survey_trigger", count: 2))
+        #expect(sut.config.storageManager?.getPersonPropertiesHash() == nil)
+
+        try FileManager.default.removeItem(at: queueURL)
+        try FileManager.default.createDirectory(at: queueURL, withIntermediateDirectories: true)
+        capture()
+        capture()
+        #expect(capturedEvents.count == (personUpdate ? 3 : 4))
+    }
+
+    // MARK: - Persisted Deduplication Tests
+
+    @Test("setPersonProperties deduplication survives a relaunch")
+    func setPersonPropertiesDeduplicationSurvivesRelaunch() async throws {
+        let firstLaunch = getSut()
+        firstLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+
+        let firstEvents = try await getServerEvents(server)
+        #expect(firstEvents.map(\.event) == ["$set"])
+
+        firstLaunch.close()
+        server.reset()
+
+        // Same properties on the next cold start: the guard is persisted, so no second $set
+        let secondLaunch = getSut()
+        secondLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+        secondLaunch.capture("second_launch")
+
+        let secondEvents = try await getServerEvents(server)
+        #expect(secondEvents.map(\.event) == ["second_launch"])
+    }
+
+    @Test("setPersonProperties captures after a relaunch when properties changed")
+    func setPersonPropertiesCapturesAfterRelaunchWhenPropertiesChanged() async throws {
+        let firstLaunch = getSut()
+        firstLaunch.setPersonProperties(userPropertiesToSet: ["tier": "pro"])
+
+        _ = try await getServerEvents(server)
+
+        firstLaunch.close()
+        server.reset()
+
+        let secondLaunch = getSut()
+        secondLaunch.setPersonProperties(userPropertiesToSet: ["tier": "free"])
+
+        let secondEvents = try await getServerEvents(server)
+        #expect(secondEvents.map(\.event) == ["$set"])
+
+        let set = secondEvents[0].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set["tier"] as? String == "free")
+    }
+
+    @Test("setPersonProperties captures after a relaunch when properties alongside a Date changed")
+    func setPersonPropertiesCapturesAfterRelaunchWhenPropertiesWithDateChanged() async throws {
+        let signupDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let firstLaunch = getSut()
+        firstLaunch.setPersonProperties(userPropertiesToSet: ["signup_date": signupDate, "tier": "pro"])
+
+        _ = try await getServerEvents(server)
+
+        firstLaunch.close()
+        server.reset()
+
+        let secondLaunch = getSut()
+        secondLaunch.setPersonProperties(userPropertiesToSet: ["signup_date": signupDate, "tier": "enterprise"])
+
+        let secondEvents = try await getServerEvents(server)
+        #expect(secondEvents.map(\.event) == ["$set"])
+
+        let set = secondEvents[0].properties["$set"] as? [String: Any] ?? [:]
+        #expect(set["tier"] as? String == "enterprise")
+    }
+
+    @Test("setPersonProperties deduplicates properties that sanitize to nothing")
+    func setPersonPropertiesDeduplicatesSanitizedEmptyProperties() async throws {
+        let sut = getSut(flushAt: 2)
+
+        // A UUID isn't serializable, so both calls sanitize down to an empty $set
+        sut.setPersonProperties(userPropertiesToSet: ["id": UUID()])
+        sut.setPersonProperties(userPropertiesToSet: ["id": UUID()])
+
+        sut.capture("test_event")
+
+        let events = try await getServerEvents(server)
+        #expect(events.map(\.event) == ["$set", "test_event"])
+    }
+
+    @Test("setPersonProperties deduplication of sanitized-empty properties survives a relaunch")
+    func sanitizedEmptyPropertiesDeduplicationSurvivesRelaunch() async throws {
+        let firstLaunch = getSut()
+        firstLaunch.setPersonProperties(userPropertiesToSet: ["id": UUID()])
+
+        let firstEvents = try await getServerEvents(server)
+        #expect(firstEvents.map(\.event) == ["$set"])
+
+        firstLaunch.close()
+        server.reset()
+
+        let secondLaunch = getSut()
+        secondLaunch.setPersonProperties(userPropertiesToSet: ["id": UUID()])
+        secondLaunch.capture("second_launch")
+
+        let secondEvents = try await getServerEvents(server)
+        #expect(secondEvents.map(\.event) == ["second_launch"])
+    }
+
+    @Test("identify does not re-send properties already carried by $identify after a relaunch")
+    func identifyDoesNotResendPropertiesCarriedByIdentifyAfterRelaunch() async throws {
+        let firstLaunch = getSut()
+        firstLaunch.identify("user123", userProperties: ["tier": "pro"])
+
+        let firstEvents = try await getServerEvents(server)
+        #expect(firstEvents.map(\.event) == ["$identify"])
+
+        firstLaunch.close()
+        server.reset()
+
+        // Same identify call on the next cold start: the $identify already sent these properties
+        let secondLaunch = getSut()
+        secondLaunch.identify("user123", userProperties: ["tier": "pro"])
+        secondLaunch.capture("second_launch")
+
+        let secondEvents = try await getServerEvents(server)
+        #expect(secondEvents.map(\.event) == ["second_launch"])
+    }
+}

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ci-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    build:
+        name: build (${{ matrix.name }})
+        runs-on: macos-15
+        timeout-minutes: 45
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: iOS
+                      destination: generic/platform=iOS
+                    - name: macOS
+                      destination: generic/platform=macOS
+                    - name: Mac Catalyst
+                      destination: platform=macOS,variant=Mac Catalyst
+                    - name: tvOS
+                      destination: generic/platform=tvOS
+                      download: tvOS
+                    - name: watchOS
+                      destination: generic/platform=watchOS
+                      download: watchOS
+                    - name: visionOS
+                      destination: generic/platform=visionOS
+                      download: visionOS
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+            - name: Install platform
+              if: ${{ matrix.download }}
+              run: xcodebuild -downloadPlatform "${{ matrix.download }}" || echo "Platform already installed or not downloadable"
+
+            - name: Build
+              run: |
+                  set -o pipefail
+                  xcrun xcodebuild clean build -scheme Txlemetry -destination "${{ matrix.destination }}" CODE_SIGNING_ALLOWED=NO | tail -n 40
+
+    swift-build:
+        name: swift build (arm64 + x86_64)
+        runs-on: macos-15
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+            - run: swift build -c release --arch arm64 --arch x86_64
+
+    pod-lint:
+        name: pod lib lint
+        runs-on: macos-15
+        timeout-minutes: 60
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+            - name: Install platforms
+              run: |
+                  for platform in tvOS watchOS visionOS; do
+                    xcodebuild -downloadPlatform "$platform" || echo "$platform already installed or not downloadable"
+                  done
+            - run: pod --version
+            - run: pod lib lint Txlemetry.podspec --allow-warnings --platforms=ios,osx,tvos,watchos,visionos

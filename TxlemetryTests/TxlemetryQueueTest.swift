@@ -1,0 +1,588 @@
+//
+//  TxlemetryQueueTest.swift
+//  TxlemetryTests
+//
+//  Created by Manoel Aranda Neto on 30.10.23.
+//
+
+import Foundation
+import Nimble
+import OHHTTPStubs
+import OHHTTPStubsSwift
+@testable import Txlemetry
+import Quick
+import Testing
+import XCTest
+
+private final class ControlledBatchSender {
+    private let lock = NSLock()
+    private var completions = [(TxlemetryUploadInfo) -> Void]()
+
+    var requestCount: Int {
+        lock.withLock { completions.count }
+    }
+
+    func send(_: [TxlemetryEvent], completion: @escaping (TxlemetryUploadInfo) -> Void) {
+        lock.withLock { completions.append(completion) }
+    }
+
+    func completeRequest(at index: Int, with result: TxlemetryUploadInfo) {
+        let completion = lock.withLock { completions[index] }
+        completion(result)
+    }
+}
+
+class TxlemetryQueueTest: QuickSpec {
+    func getSut(flushAt: Int = 1, maxQueueSize: Int = 1000, maxBatchSize: Int = 50, maxRetries: Int = 3) -> TxlemetryQueue<TxlemetryEvent> {
+        let config = TxlemetryConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+        config.flushAt = flushAt
+        config.maxQueueSize = maxQueueSize
+        config.maxBatchSize = maxBatchSize
+        config.maxRetries = maxRetries
+        config.sendFeatureFlagEvent = false
+        let storage = TxlemetryStorage(config)
+        let api = TxlemetryApi(config)
+        return TxlemetryQueue(config, storage, .batch(api: api), nil)
+    }
+
+    override func spec() {
+        var server: MockTxlemetryServer!
+
+        beforeEach {
+            server = MockTxlemetryServer()
+            server.start()
+        }
+        afterEach {
+            server.stop()
+        }
+
+        it("add item to queue") {
+            let sut = self.getSut()
+
+            let event = TxlemetryEvent(event: "event", distinctId: "distinctId")
+            sut.add(event)
+
+            expect(sut.depth) == 1
+
+            let events = getBatchedEvents(server)
+            expect(events.count) == 1
+
+            // getBatchedEvents only waits for the request to arrive; the queue pops the batch after
+            // the response is processed, so poll rather than assert synchronously.
+            expect(sut.depth).toEventually(equal(0))
+
+            sut.clear()
+        }
+
+        it("add item to queue and flush respecting flushAt") {
+            let sut = self.getSut(flushAt: 2)
+
+            let event = TxlemetryEvent(event: "event", distinctId: "distinctId")
+            let event2 = TxlemetryEvent(event: "event2", distinctId: "distinctId2")
+            let event3 = TxlemetryEvent(event: "event3", distinctId: "distinctId3")
+
+            sut.add(event)
+            expect(sut.depth) == 1
+
+            // flush() takes the batch asynchronously, so let it drain before adding more —
+            // otherwise a later add races into the in-flight peek() and joins the batch.
+            sut.add(event2)
+
+            let events = getBatchedEvents(server)
+            expect(events.count) == 2
+            expect(sut.depth).toEventually(equal(0))
+
+            sut.add(event3)
+            expect(sut.depth) == 1
+
+            sut.clear()
+        }
+
+        it("add item to queue and rotate queue") {
+            let sut = self.getSut(flushAt: 3, maxQueueSize: 2)
+
+            let event = TxlemetryEvent(event: "event", distinctId: "distinctId")
+            let event2 = TxlemetryEvent(event: "event2", distinctId: "distinctId2")
+            let event3 = TxlemetryEvent(event: "event3", distinctId: "distinctId3")
+            sut.add(event)
+            sut.add(event2)
+            sut.add(event3)
+
+            expect(sut.depth) == 2
+
+            sut.flush()
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 2
+
+            let first = events.first!
+            let last = events.last!
+            expect(first.event) == "event2"
+            expect(last.event) == "event3"
+
+            sut.clear()
+        }
+
+        it("halves both batch cap and flush threshold and retains batch on HTTP 413 when cap > 1") {
+            let sut = self.getSut(flushAt: 4, maxBatchSize: 4)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 413, headers: nil)
+            }
+
+            for i in 0 ..< 4 {
+                sut.add(TxlemetryEvent(event: "event\(i)", distinctId: "id\(i)"))
+            }
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.currentBatchCapForTesting).toEventually(equal(2))
+            expect(sut.currentFlushAtForTesting).toEventually(equal(2))
+            expect(sut.depth).toEventually(equal(4))
+
+            sut.clear()
+        }
+
+        it("halves cap based on actual batch size when queue depth was below cap") {
+            // cap=10, but only 4 events were sent (queue depth was below cap).
+            // Halve from `min(cap, batchSize)` = 4 → cap = 2, not 5. Avoids
+            // wasted halvings on a cap that wasn't reached anyway.
+            let sut = self.getSut(flushAt: 4, maxBatchSize: 10)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 413, headers: nil)
+            }
+
+            for i in 0 ..< 4 {
+                sut.add(TxlemetryEvent(event: "event\(i)", distinctId: "id\(i)"))
+            }
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.currentBatchCapForTesting).toEventually(equal(2))
+            expect(sut.depth).toEventually(equal(4))
+
+            sut.clear()
+        }
+
+        it("clamps flushAt to cap on halve so we don't buffer more than a batch") {
+            // cap=20, flushAt=10. A 413 fires on a partial batch of 2 events.
+            // Cap halves aggressively (min(20, 2) / 2 = 1) while flushAt would
+            // halve to 5 — leaving flushAt > cap and piling 5 events to send
+            // 1 at a time. Clamping flushAt to cap keeps them in step.
+            let sut = self.getSut(flushAt: 10, maxBatchSize: 20)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 413, headers: nil)
+            }
+
+            for i in 0 ..< 2 {
+                sut.add(TxlemetryEvent(event: "event\(i)", distinctId: "id\(i)"))
+            }
+            sut.flush()
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.currentBatchCapForTesting).toEventually(equal(1))
+            expect(sut.currentFlushAtForTesting).toEventually(equal(1))
+
+            sut.clear()
+        }
+
+        it("drops batch on HTTP 413 when cap is already 1") {
+            let sut = self.getSut(flushAt: 1, maxBatchSize: 1)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 413, headers: nil)
+            }
+
+            sut.add(TxlemetryEvent(event: "oversized", distinctId: "id"))
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.depth).toEventually(equal(0))
+            // Cap stays at 1 — no reset to maxBatchSize, matching Android.
+            expect(sut.currentBatchCapForTesting) == 1
+
+            sut.clear()
+        }
+
+        it("retains batch on retriable 5xx and does not change cap") {
+            let sut = self.getSut(flushAt: 2, maxBatchSize: 4)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 500, headers: nil)
+            }
+
+            sut.add(TxlemetryEvent(event: "event1", distinctId: "id1"))
+            sut.add(TxlemetryEvent(event: "event2", distinctId: "id2"))
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.depth).toEventually(equal(2))
+            expect(sut.currentBatchCapForTesting).toEventually(equal(4))
+
+            sut.clear()
+        }
+
+        it("retains batch on HTTP 429 and does not change cap") {
+            let sut = self.getSut(flushAt: 2, maxBatchSize: 4)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 429, headers: nil)
+            }
+
+            sut.add(TxlemetryEvent(event: "event1", distinctId: "id1"))
+            sut.add(TxlemetryEvent(event: "event2", distinctId: "id2"))
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.depth).toEventually(equal(2))
+            expect(sut.currentBatchCapForTesting).toEventually(equal(4))
+
+            sut.clear()
+        }
+
+        it("retains batch on HTTP 408 (request timeout is retriable) and does not change cap") {
+            let sut = self.getSut(flushAt: 2, maxBatchSize: 4)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 408, headers: nil)
+            }
+
+            sut.add(TxlemetryEvent(event: "event1", distinctId: "id1"))
+            sut.add(TxlemetryEvent(event: "event2", distinctId: "id2"))
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.depth).toEventually(equal(2))
+            expect(sut.currentBatchCapForTesting).toEventually(equal(4))
+
+            sut.clear()
+        }
+
+        it("retains retryable HTTP failures past maxRetries and drains after recovery") {
+            let mockNow = MockDate()
+            now = { mockNow.date }
+            defer { now = { Date() } }
+
+            let sut = self.getSut(flushAt: 100, maxBatchSize: 4, maxRetries: 1)
+            server.start(batchCount: 6)
+            server.batchResponseHandler = { _, requestNumber in
+                requestNumber <= 3 || requestNumber == 5
+                    ? HTTPStubsResponse(jsonObject: [], statusCode: 503, headers: nil)
+                    : HTTPStubsResponse(jsonObject: ["status": "ok"], statusCode: 200, headers: nil)
+            }
+
+            sut.add(TxlemetryEvent(event: "event1", distinctId: "id1"))
+            sut.add(TxlemetryEvent(event: "event2", distinctId: "id2"))
+
+            for expectedAttempt in 1 ... 3 {
+                sut.flush()
+                expect(server.batchRequests.count).toEventually(equal(expectedAttempt))
+                expect(sut.currentRetryCountForTesting).toEventually(equal(expectedAttempt))
+                expect(sut.depth) == 2
+                mockNow.date.addTimeInterval(60)
+            }
+
+            sut.flush()
+            expect(server.batchRequests.count).toEventually(equal(4))
+            expect(sut.depth).toEventually(equal(0))
+            expect(sut.currentRetryCountForTesting).toEventually(equal(0))
+
+            sut.add(TxlemetryEvent(event: "fresh", distinctId: "id3"))
+            sut.flush()
+            expect(server.batchRequests.count).toEventually(equal(5))
+            expect(sut.currentRetryCountForTesting).toEventually(equal(1))
+            expect(sut.depth) == 1
+            sut.flush()
+            expect(server.batchRequests.count) == 5
+            mockNow.date.addTimeInterval(1)
+            sut.flush()
+            expect(server.batchRequests.count).toEventually(equal(6))
+            expect(sut.depth).toEventually(equal(0))
+            expect(sut.currentRetryCountForTesting).toEventually(equal(0))
+
+            sut.clear()
+        }
+
+        it("retains transport failures past maxRetries and drains after recovery") {
+            let mockNow = MockDate()
+            now = { mockNow.date }
+            defer { now = { Date() } }
+
+            let sut = self.getSut(flushAt: 100, maxBatchSize: 4, maxRetries: 0)
+            let networkError = NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost, userInfo: nil)
+            server.start(batchCount: 4)
+            server.batchResponseHandler = { _, requestNumber in
+                requestNumber <= 3
+                    ? HTTPStubsResponse(error: networkError)
+                    : HTTPStubsResponse(jsonObject: ["status": "ok"], statusCode: 200, headers: nil)
+            }
+
+            sut.add(TxlemetryEvent(event: "event1", distinctId: "id1"))
+            sut.add(TxlemetryEvent(event: "event2", distinctId: "id2"))
+
+            for expectedAttempt in 1 ... 3 {
+                sut.flush()
+                expect(server.batchRequests.count).toEventually(equal(expectedAttempt))
+                expect(sut.currentRetryCountForTesting).toEventually(equal(expectedAttempt))
+                expect(sut.depth) == 2
+                mockNow.date.addTimeInterval(60)
+            }
+
+            sut.flush()
+            expect(server.batchRequests.count).toEventually(equal(4))
+            expect(sut.depth).toEventually(equal(0))
+
+            sut.clear()
+        }
+
+        it("late success removes exact in-flight identities after full-capacity replacement") {
+            let config = TxlemetryConfig(projectToken: "queue_identity_\(UUID().uuidString)", host: "http://localhost:9001")
+            config.flushAt = 100
+            config.maxQueueSize = 2
+            config.maxBatchSize = 2
+            let storage = TxlemetryStorage(config)
+            let sender = ControlledBatchSender()
+            let endpoint = QueueEndpoint<TxlemetryEvent>(
+                storageKey: .queue,
+                oldStorageKeys: [],
+                dispatchQueueLabel: "com.txlemetry.Queue.IdentityTest",
+                initialCap: { $0.maxBatchSize },
+                initialFlushAt: { $0.flushAt },
+                maxQueueSize: { $0.maxQueueSize },
+                flushIntervalSeconds: { $0.flushIntervalSeconds },
+                rateCapMax: { _ in 0 },
+                rateCapWindowSeconds: { _ in 0 },
+                encode: { toJSONData($0.toJSON()) },
+                decode: { TxlemetryEvent.fromJSON($0) },
+                describe: { $0.event },
+                send: sender.send,
+                isRetriableStatusCode: { _ in false }
+            )
+            let sut = TxlemetryQueue(config, storage, endpoint, nil)
+            defer { sut.clear() }
+            let identicalEvent = TxlemetryEvent(event: "identical", distinctId: "same-id")
+
+            sut.add(identicalEvent)
+            sut.add(identicalEvent)
+            let inFlightIds = sut.fileQueue.peekEntries(2).map(\.id)
+
+            sut.flush()
+            expect(sender.requestCount).toEventually(equal(1))
+
+            // Replace the entire in-flight batch with byte-identical payloads.
+            sut.add(identicalEvent)
+            sut.add(identicalEvent)
+            let replacementIds = sut.fileQueue.peekEntries(2).map(\.id)
+            expect(Set(inFlightIds).isDisjoint(with: replacementIds)) == true
+
+            sender.completeRequest(at: 0, with: TxlemetryUploadInfo(statusCode: 200, error: nil))
+
+            expect(sut.depth).toEventually(equal(2))
+            expect(sut.fileQueue.peekEntries(2).map(\.id)) == replacementIds
+
+            sut.flush()
+            expect(sender.requestCount).toEventually(equal(2))
+            sender.completeRequest(at: 1, with: TxlemetryUploadInfo(statusCode: 200, error: nil))
+            expect(sut.depth).toEventually(equal(0))
+        }
+
+        it("halves cap repeatedly across multiple 413s and drops once cap reaches 1") {
+            // flushAt is high so add() doesn't trigger an auto-flush — we drive
+            // each flush manually to observe the multi-step halving sequence.
+            let sut = self.getSut(flushAt: 100, maxBatchSize: 4, maxRetries: 0)
+            server.start(batchCount: 3)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 413, headers: nil)
+            }
+
+            for i in 0 ..< 4 {
+                sut.add(TxlemetryEvent(event: "event\(i)", distinctId: "id\(i)"))
+            }
+
+            // First flush: batch=4 → 413 → cap halves to 2, batch retained.
+            sut.flush()
+            expect(sut.currentBatchCapForTesting).toEventually(equal(2))
+            expect(sut.depth) == 4
+
+            // Second flush: batch=2 → 413 → cap halves to 1, batch retained.
+            sut.flush()
+            expect(sut.currentBatchCapForTesting).toEventually(equal(1))
+            expect(sut.depth) == 4
+
+            // Third flush: batch=1, cap already at 1 → drop one record. Cap
+            // stays at 1 (no reset, matching Android).
+            sut.flush()
+            expect(sut.depth).toEventually(equal(3))
+            expect(sut.currentBatchCapForTesting) == 1
+
+            sut.clear()
+        }
+
+        it("pops batch on 5xx codes outside the narrow retriable set") {
+            // 501/505/etc. are NOT in the narrow 5xx retriable set
+            // {500, 502, 503, 504}. Treat as non-retriable so a poison
+            // record can't block the queue.
+            let sut = self.getSut(flushAt: 2, maxBatchSize: 4)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 501, headers: nil)
+            }
+
+            sut.add(TxlemetryEvent(event: "event1", distinctId: "id1"))
+            sut.add(TxlemetryEvent(event: "event2", distinctId: "id2"))
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.depth).toEventually(equal(0))
+            expect(sut.currentBatchCapForTesting) == 4
+
+            sut.clear()
+        }
+
+        it("retains batch on a network error") {
+            let sut = self.getSut(flushAt: 2, maxBatchSize: 4)
+            let networkError = NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet, userInfo: nil)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(error: networkError)
+            }
+
+            sut.add(TxlemetryEvent(event: "event1", distinctId: "id1"))
+            sut.add(TxlemetryEvent(event: "event2", distinctId: "id2"))
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.depth).toEventually(equal(2))
+            expect(sut.currentBatchCapForTesting).toEventually(equal(4))
+
+            sut.clear()
+        }
+
+        it("pops batch on non-retriable 4xx so a poison record cannot block the queue") {
+            let sut = self.getSut(flushAt: 2, maxBatchSize: 4)
+            server.batchResponseHandler = { _, _ in
+                HTTPStubsResponse(jsonObject: [], statusCode: 401, headers: nil)
+            }
+
+            sut.add(TxlemetryEvent(event: "event1", distinctId: "id1"))
+            sut.add(TxlemetryEvent(event: "event2", distinctId: "id2"))
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.depth).toEventually(equal(0))
+            expect(sut.currentBatchCapForTesting).toEventually(equal(4))
+
+            sut.clear()
+        }
+
+        it("pops batch on 2xx and leaves cap unchanged (no ramp-up)") {
+            let sut = self.getSut(flushAt: 2, maxBatchSize: 4)
+
+            sut.add(TxlemetryEvent(event: "event1", distinctId: "id1"))
+            sut.add(TxlemetryEvent(event: "event2", distinctId: "id2"))
+
+            _ = getBatchedEvents(server)
+
+            expect(sut.depth).toEventually(equal(0))
+            // Cap was never reduced, so it should still be at maxBatchSize.
+            expect(sut.currentBatchCapForTesting) == 4
+
+            sut.clear()
+        }
+    }
+}
+
+@Suite("Txlemetry queue upload disposition", .serialized, .resetsGlobalState)
+struct TxlemetryQueueUploadDispositionTest {
+    private func makeQueue(snapshot: Bool, sender: ControlledBatchSender) -> TxlemetryQueue<TxlemetryEvent> {
+        let config = TxlemetryConfig(projectToken: "queue_disposition_\(UUID().uuidString)", host: "http://localhost:9001")
+        config.flushAt = 100
+        config.maxBatchSize = 4
+        config.maxRetries = 0
+        let api = TxlemetryApi(config)
+        let base: QueueEndpoint<TxlemetryEvent> = snapshot ? .snapshot(api: api) : .batch(api: api)
+        let endpoint = QueueEndpoint<TxlemetryEvent>(
+            storageKey: base.storageKey,
+            oldStorageKeys: [],
+            dispatchQueueLabel: base.dispatchQueueLabel,
+            initialCap: base.initialCap,
+            initialFlushAt: base.initialFlushAt,
+            maxQueueSize: base.maxQueueSize,
+            flushIntervalSeconds: base.flushIntervalSeconds,
+            rateCapMax: base.rateCapMax,
+            rateCapWindowSeconds: base.rateCapWindowSeconds,
+            encode: base.encode,
+            decode: base.decode,
+            describe: base.describe,
+            send: sender.send,
+            isRetriableStatusCode: base.isRetriableStatusCode
+        )
+        return TxlemetryQueue(config, TxlemetryStorage(config), endpoint, nil)
+    }
+
+    private func waitForRequest(_ count: Int, sender: ControlledBatchSender) async throws {
+        await waitUntil { sender.requestCount == count }
+        try #require(sender.requestCount == count)
+    }
+
+    @Test("received HTTP disposition wins over an accompanying transport error", arguments: [-1, 200, 400, 408, 429, 503], [false, true])
+    func receivedHTTPDisposition(statusCode: Int, snapshot: Bool) async throws {
+        let sender = ControlledBatchSender()
+        let queue = makeQueue(snapshot: snapshot, sender: sender)
+        defer { queue.clear() }
+        queue.add(TxlemetryEvent(event: "sent", distinctId: "id"))
+        let sentIds = queue.fileQueue.peekEntries(1).map(\.id)
+        queue.flush()
+        try await waitForRequest(1, sender: sender)
+        queue.add(TxlemetryEvent(event: "not-sent", distinctId: "id"))
+        let allIds = queue.fileQueue.peekEntries(2).map(\.id)
+        let response = statusCode == -1 ? nil : HTTPURLResponse(
+            url: try #require(URL(string: "http://localhost/batch")),
+            statusCode: statusCode, httpVersion: nil, headerFields: nil
+        )
+        processUploadResponse(endpointName: "test", data: nil, response: response, error: URLError(.networkConnectionLost)) {
+            sender.completeRequest(at: 0, with: $0)
+        }
+
+        let retryable = [-1, 408, 429, 503].contains(statusCode)
+        let expectedIds = retryable ? allIds : allIds.filter { !sentIds.contains($0) }
+        #expect(queue.fileQueue.peekEntries(2).map(\.id) == expectedIds)
+        #expect(queue.currentRetryCountForTesting == (retryable ? 1 : 0))
+        let reloaded = TxlemetryFileBackedQueue(queue: queue.fileQueue.queue)
+        #expect(Set(reloaded.peekEntries(2).map(\.id)) == Set(expectedIds))
+    }
+
+    @Test("413 reaches singleton after retryable failures and preserves later records", arguments: [false, true])
+    func shrinkingAfterRetryableFailures(snapshot: Bool) async throws {
+        let mockNow = MockDate()
+        now = { mockNow.date }
+        defer { now = { Date() } }
+        let sender = ControlledBatchSender()
+        let queue = makeQueue(snapshot: snapshot, sender: sender)
+        defer { queue.clear() }
+        for name in ["poison", "later-1", "later-2", "later-3"] {
+            queue.add(TxlemetryEvent(event: name, distinctId: "id"))
+        }
+        let originalIds = queue.fileQueue.peekEntries(4).map(\.id)
+        for attempt in 0 ..< 3 {
+            queue.flush()
+            try await waitForRequest(attempt + 1, sender: sender)
+            sender.completeRequest(at: attempt, with: TxlemetryUploadInfo(statusCode: 503, error: nil))
+            #expect(queue.fileQueue.peekEntries(4).map(\.id) == originalIds)
+            mockNow.date.addTimeInterval(60)
+        }
+        for (attempt, cap) in [(3, 2), (4, 1)] {
+            queue.flush()
+            try await waitForRequest(attempt + 1, sender: sender)
+            sender.completeRequest(at: attempt, with: TxlemetryUploadInfo(statusCode: 413, error: nil))
+            #expect(queue.currentBatchCapForTesting == cap)
+            #expect(queue.fileQueue.peekEntries(4).map(\.id) == originalIds)
+        }
+        queue.flush()
+        try await waitForRequest(6, sender: sender)
+        sender.completeRequest(at: 5, with: TxlemetryUploadInfo(statusCode: 413, error: nil))
+        #expect(queue.fileQueue.peekEntries(4).map(\.id) == Array(originalIds.dropFirst()))
+        #expect(queue.currentRetryCountForTesting == 0)
+        for attempt in 6 ..< 9 {
+            queue.flush()
+            try await waitForRequest(attempt + 1, sender: sender)
+            sender.completeRequest(at: attempt, with: TxlemetryUploadInfo(statusCode: 200, error: nil))
+        }
+        #expect(queue.depth == 0)
+    }
+}

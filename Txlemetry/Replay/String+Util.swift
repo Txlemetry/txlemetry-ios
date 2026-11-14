@@ -1,0 +1,14 @@
+//
+//  String+Util.swift
+//  Txlemetry
+//
+//  Created by Manoel Aranda Neto on 21.03.24.
+//
+
+import Foundation
+
+extension String {
+    func mask() -> String {
+        String(repeating: "*", count: count)
+    }
+}
