@@ -11,7 +11,7 @@ Pod::Spec.new do |s|
   s.homepage         = "http://txlemetry.com/"
   s.license          =  { :type => 'MIT' }
   s.author           = { "Txlemetry" => "support@txlemetry.com" }
-  s.source           = { :git => "https://github.com/hectorvss/txlemetry-ios.git", :tag => s.version.to_s }
+  s.source           = { :git => "https://github.com/txlemetry/txlemetry-ios.git", :tag => s.version.to_s }
 
   s.ios.deployment_target = '13.0'
   s.tvos.deployment_target = '13.0'

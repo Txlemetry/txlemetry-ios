@@ -14,7 +14,7 @@ TxlemetrySDK.shared.setup(config)
 During local validation, add this directory as a local Swift package or use a local CocoaPods path for `Txlemetry.podspec`.
 Run the SDK build and tests on macOS with Xcode using `make buildSdk`, `make test` and `make lint`.
 Validate supported platforms individually; replay is platform dependent.
-The Swift package and the CocoaPods source are published from https://github.com/hectorvss/txlemetry-ios (tag `4.0.0`).
+The Swift package and the CocoaPods source are published from https://github.com/txlemetry/txlemetry-ios (tag `4.0.0`).
 The React Native and Flutter SwiftPM integrations use that repository by default; set `TXLEMETRY_SWIFT_PACKAGE_URL` to build against a local or mirrored copy.
 
 Existing `posthog.*` storage keys, push payload/audience and tracing headers remain compatible.
